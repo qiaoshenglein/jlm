@@ -31,26 +31,47 @@ npm ci
 npm run build          # 产出 dist/
 
 # 2) 起服务（自动建表，数据库文件在 data/mirror.db）
-PORT=8791 HOST=0.0.0.0 node server/index.mjs
-#   Windows PowerShell 写法：
-#   $env:PORT=8791; $env:HOST='0.0.0.0'; node server/index.mjs
+npm run serve                    # 只给本机：http://127.0.0.1:8791
+npm run serve:lan                # 给同网段设备：http://<内网IP>:8791
+npm start                        # 完全交给环境变量（systemd / 容器里用这个）
 ```
 
-看到 `镜盘已启动：http://0.0.0.0:8791 数据驱动=sqlite 已应用 schema.sqlite.sql` 即成功。浏览器打开该地址，注册一个账户即可交易。
+三个命令跑的是同一个 `node server/index.mjs`，区别只在监听地址与端口。优先级：**命令行参数 > 环境变量 > 默认值**，所以这些写法等价：
+
+```bash
+npm run serve -- --port 8899                 # 覆盖脚本里的默认端口（重复参数取最后一个）
+node server/index.mjs --host 0.0.0.0 --port 8791
+PORT=8791 HOST=0.0.0.0 node server/index.mjs # 仅 Linux/macOS/Git Bash；PowerShell 里用 $env:PORT="8791"
+```
+
+`--host 0.0.0.0` 启动后会把可访问地址全打出来，直接复制给同事就行：
+
+```
+镜盘已启动：http://127.0.0.1:8791  http://10.0.41.8:8791  数据驱动=sqlite 已应用 schema.sqlite.sql
+```
+
+**Windows 局域网访问**还要放行一次防火墙（否则别的设备连不上）：
+
+```powershell
+netsh advfirewall firewall add rule name="mirror-desk-8791" dir=in action=allow protocol=TCP localport=8791
+```
+
+**公网访问**：不要把 `0.0.0.0:8791` 直接挂到公网——口令与会话令牌都走 POST，没有 TLS 就是明文。服务保持只监听回环（`npm run serve` 或 `HOST=127.0.0.1`），前面按第 5 节挂 Caddy / nginx；没有公网 IP 就用 frp / cloudflared / tailscale 穿透，回源那一段仍要走 https。
 
 只想在本机试跑（前后端分离、带热更新）：
 
 ```bash
 npm run dev:function   # 127.0.0.1:8000，用内存样本库（重启清空），仅调试用
 npm run dev            # 127.0.0.1:5173，Vite 已把 /functions/v1/app 代理到 8000
+npm run dev:lan        # 同上但监听 0.0.0.0，手机能连开发页（另开一个终端跑 dev:function）
 ```
 
 ## 3. 环境变量
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `HOST` | `127.0.0.1` | 监听地址。要用 nginx/Caddy 反代就保持 `127.0.0.1`；直接对外才写 `0.0.0.0` |
-| `PORT` | `8787` | 监听端口。**先确认没被别的服务占用**（本机上 8787 就撞了一个 RssHub 控制台，用 `PORT` 换掉即可） |
+| `HOST` | `127.0.0.1` | 监听地址。要用 nginx/Caddy 反代就保持 `127.0.0.1`；直接对外才写 `0.0.0.0`。也可用 `--host` 覆盖 |
+| `PORT` | `8787` | 监听端口。**先确认没被别的服务占用**（本机上 8787 就撞了一个 RssHub 控制台），`npm run serve` 已默认用 8791，或用 `--port` 覆盖 |
 | `WEB_DIR` | `dist` | 静态目录，必须已执行过 `npm run build` |
 | `DB_DRIVER` | `sqlite` | `sqlite` 或 `postgres` |
 | `DB_PATH` | `data/mirror.db` | SQLite 文件路径，目录会自动创建 |

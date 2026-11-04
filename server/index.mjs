@@ -2,15 +2,28 @@
 // 默认 SQLite，零外部依赖；DB_DRIVER=postgres 时走 PostgreSQL。
 import { createServer } from 'node:http';
 import { readFile, stat } from 'node:fs/promises';
+import { networkInterfaces } from 'node:os';
 import { dirname, extname, normalize, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createDb } from './db.mjs';
 import { handle } from '../functions/api.mjs';
 
+// 命令行参数优先于环境变量：Windows 的 cmd / PowerShell 里 `PORT=8791 node ...` 那种写法不生效。
+// 同名参数取最后一个，方便 `npm run serve -- --port 8899` 覆盖脚本里的默认端口
+const flag = (name) => {
+  const argv = process.argv.slice(2);
+  for (let i = argv.length - 1; i >= 0; i--) {
+    const item = argv[i];
+    if (item.startsWith(`--${name}=`)) return item.slice(item.indexOf('=') + 1);
+    if (item === `--${name}`) return argv[i + 1];
+  }
+  return undefined;
+};
+
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const WEB_DIR = resolve(ROOT, process.env.WEB_DIR ?? 'dist');
-const HOST = process.env.HOST ?? '127.0.0.1';
-const PORT = Number(process.env.PORT ?? 8787);
+const HOST = flag('host') ?? process.env.HOST ?? '127.0.0.1';
+const PORT = Number(flag('port') ?? process.env.PORT ?? 8787);
 const MAX_BODY = 16 * 1024;
 
 const MIME = {
@@ -142,9 +155,17 @@ const server = createServer(async (req, res) => {
 server.headersTimeout = 20_000;
 server.requestTimeout = 30_000;
 
+const listenUrls = () => {
+  if (HOST !== '0.0.0.0' && HOST !== '::') return [`http://${HOST}:${PORT}`];
+  const lan = Object.values(networkInterfaces()).flat()
+    .filter((item) => item && item.family === 'IPv4' && !item.internal)
+    .map((item) => `http://${item.address}:${PORT}`);
+  return [`http://127.0.0.1:${PORT}`, ...lan];
+};
+
 server.listen(PORT, HOST, async () => {
   const hasWeb = Boolean(await stat(WEB_DIR).catch(() => null));
-  log(`镜盘已启动：http://${HOST}:${PORT} 数据驱动=${db.driver}${migrated ? ` 已应用 ${migrated}` : ' 跳过建表'}`);
+  log(`镜盘已启动：${listenUrls().join('  ')} 数据驱动=${db.driver}${migrated ? ` 已应用 ${migrated}` : ' 跳过建表'}`);
   log(`静态目录 ${WEB_DIR}${hasWeb ? '' : ' —— 不存在，请先执行 npm run build'}`);
 });
 

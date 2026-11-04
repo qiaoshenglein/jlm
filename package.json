@@ -10,12 +10,15 @@
     "predev": "node scripts/check-node.mjs",
     "prebuild": "node scripts/check-node.mjs",
     "dev": "vite --host 127.0.0.1",
+    "dev:lan": "vite --host 0.0.0.0",
     "build": "tsc --noEmit && node scripts/build.mjs",
     "preview": "vite preview --host 127.0.0.1",
     "dev:function": "node dev/local-server.mjs",
     "check:function": "node scripts/check-functions.mjs",
     "selftest": "node dev/selftest.mjs",
     "start": "node server/index.mjs",
+    "serve": "node server/index.mjs --port 8791",
+    "serve:lan": "node server/index.mjs --host 0.0.0.0 --port 8791",
     "migrate": "node scripts/migrate.mjs"
   },
   "dependencies": {
