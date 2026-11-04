@@ -96,6 +96,7 @@ CREATE TABLE IF NOT EXISTS watchlists (
   code       TEXT,
   name       TEXT,
   kind       TEXT,
+  sort       INTEGER,
   created_at TEXT NOT NULL,
   UNIQUE (user_id, secid)
 );

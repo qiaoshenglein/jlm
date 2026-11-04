@@ -184,10 +184,16 @@ class SqlClient {
   }
 
   async migrate(driver) {
-    const sql = readFileSync(join(HERE, SCHEMA_FILE[driver] ?? SCHEMA_FILE.sqlite), 'utf8');
-    await this.exec(sql);
-    return SCHEMA_FILE[driver] ?? SCHEMA_FILE.sqlite;
+    const file = SCHEMA_FILE[driver] ?? SCHEMA_FILE.sqlite;
+    await this.exec(readFileSync(join(HERE, file), 'utf8'));
+    // 老库升级：CREATE TABLE IF NOT EXISTS 不会给已存在的表加列，这里逐条补，重复即忽略
+    for (const statement of this.columnPatches()) {
+      try { await this.exec(statement); } catch { /* 列已存在 */ }
+    }
+    return file;
   }
+
+  columnPatches() { return []; }
 }
 
 class SqliteClient extends SqlClient {
@@ -202,6 +208,8 @@ class SqliteClient extends SqlClient {
   }
 
   placeholder() { return '?'; }
+
+  columnPatches() { return ['ALTER TABLE watchlists ADD COLUMN sort INTEGER']; }
 
   async execute(sql, params) {
     return this.db.prepare(sql).all(...params);
@@ -221,6 +229,8 @@ class PgClient extends SqlClient {
   }
 
   placeholder(index) { return `$${index}`; }
+
+  columnPatches() { return ['ALTER TABLE IF NOT EXISTS app.watchlists ADD COLUMN IF NOT EXISTS sort BIGINT']; }
 
   async execute(sql, params) {
     const result = await this.pool.query(sql, params);

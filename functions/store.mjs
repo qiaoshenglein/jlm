@@ -170,8 +170,8 @@ export class Store {
 
   async listWatch(userId) {
     const result = await this.sb.from(TABLES.watchlists)
-      .select('id,secid,code,name,kind,created_at')
-      .eq('user_id', userId).order('created_at', { ascending: false }).limit(80);
+      .select('id,secid,code,name,kind,sort,created_at')
+      .eq('user_id', userId).order('sort', { ascending: true }).order('created_at', { ascending: true }).limit(80);
     return fail(result, 'read_failed') ?? [];
   }
 
@@ -179,6 +179,18 @@ export class Store {
     const result = await this.sb.from(TABLES.watchlists).insert(row).select('id,secid,code,name,kind,created_at').maybeSingle();
     if (result?.error?.code === '23505') return null; // 已在自选里
     return fail(result, 'write_failed');
+  }
+
+  // 整表覆写顺序：一次同步里逐行写 sort，行数上限 80，失败可由前端重读纠正
+  async sortWatch(userId, rows) {
+    const results = [];
+    for (const row of rows) {
+      const result = await this.sb.from(TABLES.watchlists)
+        .update({ sort: row.sort }).eq('user_id', userId).eq('secid', row.secid).select('id').maybeSingle();
+      if (result && result.error) throw new StoreError(result.error.code ?? 'write_failed');
+      results.push(Boolean(result?.data?.id));
+    }
+    return results;
   }
 
   async removeWatch(userId, secid) {

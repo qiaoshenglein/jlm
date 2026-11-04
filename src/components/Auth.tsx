@@ -3,7 +3,7 @@ import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { ApiError } from '../api';
-import { MiniBar } from './charts';
+import { MiniBar, PriceCell } from './charts';
 import { percent, priceText, tone, type Board, type Session } from '../format';
 
 type Mode = 'login' | 'register';
@@ -49,25 +49,26 @@ export function Auth({ board, session, onSubmit }: {
       <div className="relative mx-auto grid min-h-dvh w-full max-w-6xl gap-10 px-5 py-8 lg:grid-cols-[1.15fr_0.85fr] lg:items-center lg:px-10">
         <section>
           <div className="flex items-baseline gap-3">
-            <h1 className="text-5xl font-semibold tracking-[0.18em] text-foreground sm:text-6xl">镜盘</h1>
-            <span className="num text-xs tracking-[0.3em] text-primary">MIRROR DESK</span>
+            <h1 className="text-[3.375rem] font-semibold leading-none tracking-[0.16em] text-foreground sm:text-6xl">镜盘</h1>
+            <span className="num text-[0.6875rem] tracking-[0.32em] text-primary">MIRROR DESK</span>
           </div>
-          <p className="mt-4 max-w-xl text-sm leading-7 text-muted-foreground">
+          <p className="mt-3 text-[0.8438rem] leading-[1.5] text-foreground/85">沪深实时行情的两融仿真交易台</p>
+          <p className="mt-3 max-w-xl text-[0.8125rem] leading-7 text-muted-foreground">
             对接沪深实时行情的两融仿真交易台。涨跌幅限制、T+1 交收、佣金印花税过户费、
             维持担保比例与强制平仓，全部按 A 股真实规则计算。开户即得 100 万虚拟本金，
             杠杆最高 5 倍，随时可能被强平。
           </p>
 
-          <div className="mt-8 space-y-2.5">
+          <div className="mt-7 space-y-2">
             {indexes.length === 0 && (
               <p className="text-xs text-muted-foreground">正在拉取沪深实时行情…</p>
             )}
             {indexes.map((quote) => (
-              <div key={quote.secid} className="flex items-center gap-3 border-b border-hairline/60 pb-2 text-sm">
-                <span className="w-24 shrink-0 truncate">{quote.name}</span>
-                <span className={`num w-24 shrink-0 text-right ${tone(quote.pct)}`}>{priceText(quote.last, quote.tick)}</span>
-                <span className={`num w-20 shrink-0 text-right ${tone(quote.pct)}`}>{percent(quote.pct)}</span>
-                <span className="ml-auto"><MiniBar pct={quote.pct} /></span>
+              <div key={quote.secid} className="grid grid-cols-[7.5rem_auto_auto_1fr] items-center gap-3 border-b border-hairline/60 py-1.5 text-[0.8438rem]">
+                <span className="truncate text-muted-foreground">{quote.name}</span>
+                <PriceCell value={quote.last} tick={quote.tick} className={tone(quote.pct)} />
+                <span className={`num w-[4.6rem] text-right ${tone(quote.pct)}`}>{percent(quote.pct)}</span>
+                <span className="justify-self-end"><MiniBar pct={quote.pct} /></span>
               </div>
             ))}
           </div>
@@ -78,12 +79,12 @@ export function Auth({ board, session, onSubmit }: {
           </p>
         </section>
 
-        <section className="rounded-lg border border-hairline bg-panel/85 p-6 shadow-[0_30_80px_-40px_rgba(0,0,0,0.9)] backdrop-blur">
+        <section className="panel p-6 backdrop-blur">
           <div className="mb-6 flex gap-1 rounded-md bg-muted/60 p-1 text-sm">
             {(['login', 'register'] as Mode[]).map((value) => (
               <button key={value} type="button" onClick={() => { setMode(value); setError(''); }}
                 aria-pressed={mode === value}
-                className={`flex-1 rounded px-3 py-2 transition ${mode === value ? 'bg-raised text-foreground shadow' : 'text-muted-foreground hover:text-foreground'}`}>
+                className={`flex-1 rounded px-3 py-2 transition-colors duration-75 active:translate-y-px ${mode === value ? 'bg-raised text-foreground shadow' : 'text-muted-foreground hover:text-foreground'}`}>
                 {value === 'login' ? '登录交易' : '开立新账户'}
               </button>
             ))}
@@ -140,7 +141,7 @@ export function Auth({ board, session, onSubmit }: {
             <Button type="submit" className="w-full" disabled={!canSubmit}>
               {busy ? '提交中…' : mode === 'login' ? '进入交易台' : '开户并注入 100 万虚拟本金'}
             </Button>
-            <p className="text-center text-[11px] leading-5 text-ink-dim">
+            <p className="text-center text-[0.75rem] leading-5 text-ink-dim">
               口令以 PBKDF2-SHA256 加盐存储，服务端只保留会话令牌摘要。
             </p>
           </form>

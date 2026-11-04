@@ -98,6 +98,7 @@ CREATE TABLE IF NOT EXISTS app.watchlists (
   code       TEXT,
   name       TEXT,
   kind       TEXT,
+  sort       BIGINT,
   created_at TIMESTAMPTZ NOT NULL,
   UNIQUE (user_id, secid)
 );

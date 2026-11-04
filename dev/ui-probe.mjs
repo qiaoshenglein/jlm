@@ -1,0 +1,282 @@
+// UI geometry probe: fixed-height paginated stock list. Run: node dev/ui-probe.mjs
+import { createRequire } from 'node:module';
+import { spawn } from 'node:child_process';
+import { createServer } from 'node:net';
+import { mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
+
+const require = createRequire(import.meta.url);
+const { chromium } = require('D:/game/cf-transport-ship/node_modules/playwright-core');
+const ROOT = resolve(import.meta.dirname, '..');
+const CHROME = 'C:/Program Files/Google/Chrome/Application/chrome.exe';
+
+const results = [];
+const ok = (name, pass, detail = '') => results.push(`${pass ? 'PASS' : 'FAIL'} ${name}${detail ? ` :: ${detail}` : ''}`);
+const at = (text) => { const m = text.match(/(\d+)\s*\/\s*(\d+)/); return m ? [Number(m[1]), Number(m[2])] : null; };
+const freePort = () => new Promise((done) => {
+  const probe = createServer();
+  probe.listen(0, '127.0.0.1', () => { const p = probe.address().port; probe.close(() => done(p)); });
+});
+
+const dir = mkdtempSync(join(tmpdir(), 'mkt-probe-'));
+const port = await freePort();
+const child = spawn(process.execPath, ['server/index.mjs'], {
+  cwd: ROOT,
+  env: { ...process.env, PORT: String(port), HOST: '127.0.0.1', DB_DRIVER: 'sqlite', DB_PATH: join(dir, 'probe.db') },
+  stdio: ['ignore', 'pipe', 'pipe'],
+});
+child.stdout.on('data', () => {});
+child.stderr.on('data', (chunk) => process.stderr.write(chunk));
+
+const base = `http://127.0.0.1:${port}`;
+let browser = null;
+try {
+  let up = false;
+  for (let i = 0; i < 40; i++) {
+    try {
+      const ping = await fetch(`${base}/healthz`, { cache: 'no-store' });
+      if (ping.ok) { up = true; break; }
+    } catch { /* not up yet */ }
+    await new Promise((r) => setTimeout(r, 150));
+  }
+  ok('server-up', up, base);
+
+  browser = await chromium.launch({ executablePath: CHROME, headless: true, args: ['--no-sandbox', '--mute-audio'] });
+  const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
+  const errors = [];
+  page.on('pageerror', (error) => errors.push(String(error.message).slice(0, 120)));
+  await page.goto(base, { waitUntil: 'domcontentloaded' });
+
+  const auth = await page.evaluate(async () => {
+    const response = await fetch('/functions/v1/app?action=register', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+      body: JSON.stringify({ username: `pg_${Date.now().toString(36)}`, password: 'probe12345', display: 'pg' }),
+    });
+    const data = await response.json();
+    if (data?.ok) localStorage.setItem('mirror.desk.token', data.token);
+    return Boolean(data?.ok);
+  });
+  ok('register-throwaway-user', auth === true);
+  await page.reload({ waitUntil: 'domcontentloaded' });
+
+  await page.waitForFunction(() => document.querySelectorAll('.dense-row:not([aria-hidden])').length > 0, null, { timeout: 25_000 });
+
+  const snap = () => page.evaluate(() => {
+    const panel = document.querySelector('[aria-label="行情分类"]').closest('.panel');
+    const body = panel.querySelector('footer').previousElementSibling;
+    const rows = [...body.querySelectorAll('.dense-row:not([aria-hidden])')];
+    const boxes = [...body.querySelectorAll('.dense-row')];
+    const foot = panel.querySelector('footer');
+    const h = (el) => Math.round(el.getBoundingClientRect().height);
+    return {
+      rows: rows.length,
+      boxes: boxes.length,
+      first: rows[0]?.textContent?.slice(0, 6) ?? '',
+      panelH: h(panel),
+      panelW: Math.round(panel.getBoundingClientRect().width),
+      bodyH: h(body),
+      kids: [...panel.children].map(h).join(','),
+      rowH: rows.length ? h(rows[0]) : 0,
+      listScroll: body.scrollHeight - body.clientHeight,
+      uniform: (() => {
+        const list = [...body.querySelectorAll('.dense-row')].map(h);
+        return list.every((value) => Math.abs(value - list[0]) <= 1) ? list[0] : -1;
+      })(),
+      clipped: [...body.querySelectorAll('.dense-row')].filter((el) => el.scrollHeight > el.clientHeight + 1).length,
+      pager: foot.textContent.replace(/\s+/g, ' ').trim(),
+      footBottom: Math.round(foot.getBoundingClientRect().bottom),
+      overflowX: document.documentElement.scrollWidth - document.documentElement.clientWidth,
+    };
+  });
+
+  // 1) desktop, a tab with more than one page
+  await page.getByRole('tab', { name: '个股' }).click();
+  await page.waitForFunction(() => document.querySelectorAll('.dense-row:not([aria-hidden])').length === 10, null, { timeout: 8_000 });
+  const p1 = await snap();
+  const pageOne = at(p1.pager);
+  ok('rows-equal-10', p1.rows === 10 && p1.boxes === 10, `rows=${p1.rows} boxes=${p1.boxes}`);
+  ok('pager-shows-page-1', Boolean(pageOne) && pageOne[0] === 1 && pageOne[1] >= 2, p1.pager);
+  ok('row-height-uniform', p1.uniform > 0, `row=${p1.rowH} uniform=${p1.uniform} kids=${p1.kids} panelW=${p1.panelW}`);
+  ok('no-row-clipping', p1.clipped === 0, `clipped=${p1.clipped} row=${p1.rowH} kids=${p1.kids}`);
+  ok('chrome-single-line', p1.kids.split(',').map(Number)[0] <= 46, `header=${p1.kids}`);
+  ok('page-count-matches-height', p1.boxes === Math.max(1, Math.min(10, Math.floor(p1.bodyH / p1.rowH))), `boxes=${p1.boxes} body=${p1.bodyH} row=${p1.rowH}`);
+  ok('list-not-scrollable', p1.listScroll <= 1, `scroll=${p1.listScroll}`);
+
+  // 2) next page: content changes, geometry does not
+  await page.getByRole('button', { name: '下一页' }).click();
+  await page.waitForTimeout(150);
+  const p2 = await snap();
+  const pageTwo = at(p2.pager);
+  ok('next-page-advances', Boolean(pageTwo) && pageTwo[0] === 2, p2.pager);
+  ok('next-page-new-content', p2.first !== p1.first, `${p1.first} -> ${p2.first}`);
+  ok('next-page-height-stable', p2.panelH === p1.panelH && p2.bodyH === p1.bodyH, `panel ${p1.panelH}/${p2.panelH} body ${p1.bodyH}/${p2.bodyH}`);
+
+  // 3) a short (empty) list must not shrink the window
+  await page.getByRole('tab', { name: '自选' }).click();
+  await page.waitForTimeout(250);
+  const p3 = await snap();
+  ok('empty-list-still-10-boxes', p3.boxes === 10 && p3.rows === 0, `boxes=${p3.boxes} rows=${p3.rows}`);
+  ok('empty-list-height-stable', p3.panelH === p1.panelH, `${p1.panelH} vs ${p3.panelH}`);
+  ok('empty-list-pager-blank', p3.pager.includes('—') && !at(p3.pager), p3.pager);
+
+  // 4) keyboard selection past the page edge flips the page automatically
+  await page.getByRole('tab', { name: '个股' }).click();
+  await page.waitForTimeout(250);
+  for (let i = 0; i < 11; i++) await page.keyboard.press('ArrowDown');
+  await page.waitForTimeout(250);
+  const p4 = await snap();
+  const marked = await page.evaluate(() => {
+    const rows = [...document.querySelectorAll('.dense-row:not([aria-hidden])')];
+    const hit = rows.find((el) => getComputedStyle(el).boxShadow.includes('inset'));
+    return hit ? hit.textContent.slice(0, 6) : null;
+  });
+  const pageFour = at(p4.pager);
+  ok('keyboard-flips-page', Boolean(pageFour) && pageFour[0] === 2, p4.pager);
+  ok('keyboard-selection-visible', Boolean(marked), String(marked));
+
+  // 5) search results use the same window
+  const box = page.locator('input[aria-label^="搜索标的"]');
+  await box.fill('600');
+  await page.waitForTimeout(1_800);
+  const p5 = await snap();
+  ok('search-rows-max-10', p5.rows > 0 && p5.rows <= 10 && p5.boxes === 10, `rows=${p5.rows} boxes=${p5.boxes}`);
+  ok('search-height-stable', p5.panelH === p1.panelH, `${p1.panelH} vs ${p5.panelH}`);
+  await box.fill('');
+  await page.waitForTimeout(300);
+
+  // 5b) 手感：光标、整行热区、按下即选中、悬停预热、滚轮与翻页键、星标乐观更新
+  await page.getByRole('tab', { name: '个股' }).click();
+  await page.waitForTimeout(400);
+
+  const cursor = await page.evaluate(() => {
+    const row = document.querySelector('.dense-row:not([aria-hidden])');
+    return { row: getComputedStyle(row).cursor, star: getComputedStyle(row.querySelector('button[aria-label*="自选"]')).cursor };
+  });
+  ok('cursor-says-clickable', cursor.row === 'pointer' && cursor.star === 'pointer', JSON.stringify(cursor));
+
+  const press = await page.evaluate(async () => {
+    const target = document.querySelectorAll('.dense-row:not([aria-hidden])')[4];
+    const t0 = performance.now();
+    target.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, button: 0, pointerType: 'mouse' }));
+    await new Promise((r) => requestAnimationFrame(r));
+    return { ms: Math.round(performance.now() - t0), hit: target.getAttribute('aria-pressed') === 'true' };
+  });
+  ok('pointerdown-selects-in-one-frame', press.hit && press.ms < 60, `hit=${press.hit} ms=${press.ms}`);
+
+  const rowBox = await page.locator('.dense-row:not([aria-hidden])').nth(7).boundingBox();
+  await page.mouse.move(rowBox.x + rowBox.width - 42, rowBox.y + rowBox.height / 2);
+  await page.mouse.down();
+  await page.mouse.up();
+  await page.waitForTimeout(150);
+  const pressed = await page.evaluate(() => document.querySelectorAll('.dense-row[aria-pressed="true"]').length);
+  ok('whole-row-is-hit-area', pressed === 1, `selected=${pressed}`);
+
+  await page.waitForTimeout(900);
+  const chartState = await page.evaluate(() => ({
+    loading: /图表加载中/.test(document.body.innerText),
+    named: Boolean(document.querySelector('h2')?.textContent),
+  }));
+  ok('hover-prefetch-kills-chart-wait', !chartState.loading && chartState.named, JSON.stringify(chartState));
+
+  const chartLatency = await page.evaluate(async () => {
+    const call = async (secid) => {
+      const t0 = performance.now();
+      const response = await fetch('/functions/v1/app?action=chart', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ secid, kind: 'trends' }),
+      });
+      await response.json();
+      return Math.round(performance.now() - t0);
+    };
+    const cold = await call('1.601318');
+    const warm = await call('1.601318');
+    const again = await call('1.601318');
+    return { cold, warm, again };
+  });
+  ok('server-chart-cache', chartLatency.warm < chartLatency.cold, JSON.stringify(chartLatency));
+
+  await page.mouse.move(rowBox.x + 60, rowBox.y + 6);
+  const beforeWheel = at((await snap()).pager);
+  await page.mouse.wheel(0, 140);
+  await page.waitForTimeout(350);
+  const afterWheel = at((await snap()).pager);
+  ok('wheel-turns-page', Boolean(beforeWheel && afterWheel) && afterWheel[0] === beforeWheel[0] + 1, `${beforeWheel} -> ${afterWheel}`);
+
+  await page.mouse.click(700, 300);
+  const beforeKey = at((await snap()).pager);
+  await page.keyboard.press('PageDown');
+  await page.waitForTimeout(300);
+  const afterKey = at((await snap()).pager);
+  ok('pagedown-turns-page', Boolean(beforeKey && afterKey) && afterKey[0] === beforeKey[0] + 1, `${beforeKey} -> ${afterKey}`);
+
+  let syncs = 0;
+  page.on('request', (req) => { if (req.url().includes('action=sync')) syncs += 1; });
+  // 先对齐 3 秒轮询的相位，再判定「点星标不该额外触发全量同步」
+  await page.waitForRequest((req) => req.url().includes('action=sync'), { timeout: 6_000 }).catch(() => {});
+  syncs = 0;
+  await page.route('**/action=watch_add', async (route) => {
+    await new Promise((r) => setTimeout(r, 400));
+    await route.continue();
+  });
+  const star = page.locator('.dense-row:not([aria-hidden])').nth(1).locator('button[aria-label*="自选"]');
+  const starLabel = await star.getAttribute('aria-label');
+  await star.click();
+  const flipped = await page.evaluate((label) => document.querySelector(`button[aria-label="${label}"]`) === null, starLabel);
+  await page.waitForTimeout(250);
+  ok('star-flips-before-server', flipped, `label=${starLabel}`);
+  ok('watch-toggle-skips-full-sync', syncs === 0, `syncs=${syncs}`);
+  await page.unroute('**/action=watch_add');
+
+  // 5c) 搜索：回车直接选第一条，✕ 清空
+  await box.fill('600519');
+  await page.waitForTimeout(900);
+  await box.press('Enter');
+  await page.waitForTimeout(500);
+  const picked = await page.evaluate(() => document.querySelector('h2')?.textContent ?? '');
+  ok('enter-picks-first-result', picked.includes('贵州茅台'), `head=${picked.length}`);
+  const clear = page.getByRole('button', { name: '清空搜索' });
+  ok('clear-button-present', await clear.count() === 1);
+  await clear.click();
+  await page.waitForTimeout(300);
+  ok('clear-button-empties-input', (await box.inputValue()) === '');
+
+  // 6) layout hygiene
+  const p6 = await snap();
+  ok('no-horizontal-overflow', p6.overflowX <= 0, `overflowX=${p6.overflowX}`);
+  ok('pager-inside-viewport', p6.footBottom <= 900, `footBottom=${p6.footBottom}`);
+
+  // 7) mobile shell: smaller page size, everything on screen
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.waitForTimeout(600);
+  const m = await page.evaluate(() => {
+    const panel = document.querySelector('[aria-label="行情分类"]').closest('.panel');
+    const body = panel.querySelector('footer').previousElementSibling;
+    const foot = panel.querySelector('footer');
+    return {
+      boxes: body.querySelectorAll('.dense-row').length,
+      rows: body.querySelectorAll('.dense-row:not([aria-hidden])').length,
+      listScroll: body.scrollHeight - body.clientHeight,
+      bodyH: Math.round(body.getBoundingClientRect().height),
+      rowH: Math.round((body.querySelector('.dense-row')?.getBoundingClientRect().height) ?? 0),
+      overflowY: document.documentElement.scrollHeight - document.documentElement.clientHeight,
+      overflowX: document.documentElement.scrollWidth - document.documentElement.clientWidth,
+      footBottom: Math.round(foot.getBoundingClientRect().bottom),
+      pager: foot.textContent.replace(/\s+/g, ' ').trim(),
+    };
+  });
+  ok('mobile-page-fits', m.boxes >= 3 && m.boxes <= 10 && m.rows > 0, `boxes=${m.boxes} rows=${m.rows} body=${m.bodyH} row=${m.rowH}`);
+  ok('mobile-list-not-scrollable', m.listScroll <= 1, `scroll=${m.listScroll} boxes=${m.boxes} body=${m.bodyH}`);
+  ok('mobile-no-document-scroll', m.overflowY <= 0 && m.overflowX <= 0, `y=${m.overflowY} x=${m.overflowX}`);
+  ok('mobile-pager-visible', m.footBottom <= 844, `footBottom=${m.footBottom} ${m.pager}`);
+
+  ok('no-page-errors', errors.length === 0, errors.join(' | '));
+} catch (error) {
+  ok('probe-completed', false, String(error.message).slice(0, 220));
+} finally {
+  await browser?.close().catch(() => {});
+  child.kill();
+  console.log(results.join('\n'));
+  console.log(`SUMMARY pass=${results.filter((line) => line.startsWith('PASS')).length} fail=${results.filter((line) => line.startsWith('FAIL')).length}`);
+}

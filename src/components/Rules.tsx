@@ -21,6 +21,24 @@ export function Rules({ extra, onClose }: { extra: Record<string, string> | null
         ))}
 
         <section className="mb-5">
+          <h3 className="mb-2 text-xs tracking-wide text-primary">键盘快捷键</h3>
+          <ul className="grid gap-1.5 text-xs text-muted-foreground">
+            {[['/', '聚焦搜索框（输入后回车直接选中第一条）'], ['J / K 或 ↑ ↓', '在列表里上下选标的'],
+              ['滚轮 / PageUp Down', '左侧列表翻页（一页最多 10 条，选中项跨页会自动跟翻）'],
+              ['Home / End', '跳到列表首页 / 末页'],
+              ['B / S', '切换买入与卖出方向（信用页内切换融资/融券）'],
+              ['1 – 5', '切换杠杆倍数（仅融资买入、融券卖出有效）'], ['Enter', '提交委托（数量框内同样有效）'],
+              ['1 / 2 / 3', '手机与窄屏：行情 / 交易 / 账户'], ['Esc', '关闭本说明、清空搜索或退出输入框']].map(([key, text]) => (
+              <li key={key} className="flex items-baseline gap-2">
+                <kbd className="num shrink-0 rounded border border-hairline bg-surface-2 px-1.5 py-0.5 text-[0.6875rem] text-foreground">{key}</kbd>
+                <span>{text}</span>
+              </li>
+            ))}
+          </ul>
+          <p className="mt-2 text-[0.6875rem] leading-5 text-ink-dim">快捷键在输入框内不生效（Enter 除外），也不会拦截带 Ctrl / Cmd / Alt 的组合键。</p>
+        </section>
+
+        <section className="mb-5">
           <h3 className="mb-2 text-xs tracking-wide text-primary">委托可能被拒绝的原因</h3>
           <ul className="grid gap-1 text-xs text-ink-dim">
             {Object.entries(extra ?? {}).map(([code, text]) => (
@@ -28,7 +46,7 @@ export function Rules({ extra, onClose }: { extra: Record<string, string> | null
             ))}
           </ul>
         </section>
-        <p className="border-t border-hairline pt-3 text-[11px] leading-6 text-ink-dim">
+        <p className="border-t border-hairline pt-3 text-[0.75rem] leading-6 text-ink-dim">
           本平台为 A 股交易规则仿真器。行情由东方财富公开接口提供，可能存在数秒延迟；成交以最新价一次性全额撮合，
           不考虑盘口深度与排队。所有资金均为虚拟资金，强制平仓与排行榜只用于训练，不构成投资建议。
         </p>

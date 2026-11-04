@@ -223,6 +223,16 @@ check('按拼音首字母搜索命中', (byPinyin.json.rows ?? []).some((row) =>
 const byChinese = await call('search', { q: '中证500' });
 check('中文关键词有结果', (byChinese.json.rows ?? []).length > 0,
   (byChinese.json.rows ?? []).slice(0, 3).map((row) => `${row.name}(${row.kind})`).join(' '));
+// 回归：4.06 这类十进制价格乘 1e6 会略小于整数，早先用 trunc 会被削成 4059999 判为不合法
+const awkward = await call('preview', { side: 'buy', secid: etf.secid, qty: 100, mode: 'limit', limitPrice: '4.06', leaf: 1 }, token);
+check('4.06 这类限价不再被误判为价格非法', awkward.json.ok === true || awkward.json.code !== 'price_invalid',
+  awkward.json.ok ? `可买上限 ${awkward.json.preview?.qty ?? 'ok'}` : awkward.json.code);
+const twoDec = (Math.round((etf.low ?? etf.last * 0.97) / 10_000) / 100 + 0.005).toFixed(2);
+const awkwardOrder = await call('order', { side: 'buy', secid: etf.secid, qty: 300, mode: 'limit', limitPrice: twoDec, leaf: 1 }, token);
+check(`两位小数的限价（${twoDec}）可提交`, awkwardOrder.json.ok === true, awkwardOrder.json.code ?? awkwardOrder.json.order?.status);
+const dupGuard = await call('order', { side: 'buy', secid: etf.secid, qty: 300, mode: 'limit', limitPrice: twoDec, leaf: 1 }, token);
+check('完全相同的重复委托被拦截并要求确认', dupGuard.json.code === 'duplicate_order', dupGuard.json.code ?? '未拦截');
+
 const junkSearch = await call('search', { q: '不存在的标的zzz' });
 check('无匹配返回空列表而不是报错', junkSearch.json.ok === true && junkSearch.json.rows.length === 0, `rows=${junkSearch.json.rows?.length}`);
 
@@ -241,6 +251,11 @@ check('池外自选也能取到实时价', (sync5.json.watchQuotes ?? []).some((
   (sync5.json.watchQuotes ?? []).map((quote) => `${quote.code}:${((quote.last ?? 0) / Y).toFixed(2)}`).join(' '));
 check('同步返回本轮成交明细', Array.isArray(sync5.json.fills), `新增成交 ${sync5.json.fills?.length ?? 0} 笔`);
 
+const reordered = await call('watch_sort', { secids: ['1.600519', etf.secid] }, token);
+check('自选可按提交顺序重排', reordered.json.watch?.map((row) => row.secid).join(',') === `1.600519,${etf.secid}`,
+  reordered.json.watch?.map((row) => row.code).join(','));
+const bogusSort = await call('watch_sort', { secids: ['1.000001'] }, token);
+check('不含本人自选标的的顺序请求被拒', bogusSort.json.code === 'order_invalid', bogusSort.json.code ?? 'ok');
 const removed = await call('watch_remove', { secid: '1.600519' }, token);
 check('移出自选成功', removed.json.ok === true && removed.json.watch.length === 1, `剩 ${removed.json.watch?.length ?? 0} 个`);
 

@@ -1,12 +1,14 @@
 import { useState } from 'react';
 import { Button } from '@/components/ui/button';
-import { EquityCurve } from './charts';
+import { EquityCurve, PriceCell } from './charts';
 import {
   SIDE_LABEL, STATUS_LABEL, clockTime, dayTime, money, percent, priceText, ratioText,
   shares, tone, type Account, type OrderRow, type TradeRow,
 } from '../format';
 
 type Panel = 'position' | 'order' | 'fill' | 'risk' | 'note';
+const BUY_SIDE_SET = new Set(['buy', 'margin_buy', 'cover_buy']);
+
 const PANELS: { key: Panel; label: string }[] = [
   { key: 'position', label: '持仓' },
   { key: 'order', label: '委托' },
@@ -32,21 +34,23 @@ export function Book({ account, orders, trades, events, curve, leader, startCash
     : panel === 'note' ? events.length : account?.positions.length ?? 0;
 
   return (
-    <div className="flex h-full flex-col rounded-lg border border-hairline bg-panel">
-      <header className="flex items-center gap-1 border-b border-hairline px-2 py-1.5">
+    <div className="panel flex h-full flex-col overflow-hidden">
+      <header className="flex shrink-0 items-center gap-1 border-b border-hairline px-2 py-1">
         {PANELS.map((item) => (
           <button key={item.key} type="button" onClick={() => setPanel(item.key)} aria-selected={panel === item.key}
-            className={`rounded px-2.5 py-1 text-xs transition ${panel === item.key ? 'bg-raised text-primary' : 'text-muted-foreground hover:text-foreground'}`}>
+            className={`relative rounded px-2.5 py-1.5 text-[0.8125rem] transition-colors duration-75 active:translate-y-px ${panel === item.key
+              ? 'text-primary after:absolute after:inset-x-2 after:-bottom-[5px] after:h-0.5 after:rounded-full after:bg-primary'
+              : 'text-muted-foreground hover:text-foreground'}`}>
             {item.label}
             {item.key !== 'risk' && (
-              <span className="num ml-1 text-[10px] text-ink-dim">
+              <span className="num ml-1 text-[0.6875rem] text-ink-dim">
                 {item.key === 'position' ? (account?.positions.length ?? 0)
                   : item.key === 'order' ? orders.length : item.key === 'fill' ? trades.length : events.length}
               </span>
             )}
           </button>
         ))}
-        <span className="num ml-auto hidden pr-2 text-[11px] text-ink-dim lg:inline">
+        <span className="num ml-auto hidden pr-2 text-[0.75rem] text-ink-dim lg:inline">
           净资产 ¥{money(account?.netAssets ?? 0)} · 杠杆 {account?.leverage ? `${account.leverage.toFixed(2)}×` : '—'}
         </span>
       </header>
@@ -73,7 +77,7 @@ const minWidth = (cols: string[]) => ({ minWidth: `${cols.length * 5.5}rem` });
 
 function Head({ cols }: { cols: string[] }) {
   return (
-    <div className="grid gap-2 border-b border-hairline/70 px-3 py-1.5 text-[11px] text-ink-dim"
+    <div className="sticky top-0 z-10 grid gap-2 border-b border-hairline bg-surface-1 px-3 py-1.5 text-[0.7188rem] tracking-[0.04em] text-ink-dim"
       style={{ ...minWidth(cols), gridTemplateColumns: cols.map(() => 'minmax(0,1fr)').join(' ') }}>
       {cols.map((label) => <span key={label}>{label}</span>)}
     </div>
@@ -87,11 +91,11 @@ function Positions({ account, onSelect }: { account: Account | null; onSelect: (
       <Head cols={cols} />
       {(account?.positions ?? []).map((position) => (
         <button key={`${position.symbol}-${position.side}`} type="button" onClick={() => onSelect(position.symbol)}
-          className="grid w-full gap-2 border-b border-hairline/40 px-3 py-2 text-left text-xs hover:bg-raised"
+          className={`dense-row grid w-full gap-2 border-b border-hairline/40 px-3 text-left text-[0.8125rem] transition-colors duration-75 hover:bg-surface-2 active:bg-surface-3 ${position.side === 'long' ? 'shadow-[inset_2px_0_0_var(--up)]' : 'shadow-[inset_2px_0_0_var(--down)]'}`}
           style={{ ...minWidth(cols), gridTemplateColumns: cols.map(() => 'minmax(0,1fr)').join(' ') }}>
           <span className="min-w-0">
             <span className="block truncate">{position.name}</span>
-            <span className="num text-[10px] text-ink-dim">
+            <span className="num text-[0.6875rem] text-ink-dim">
               {position.code} · {position.side === 'long' ? '多头' : '融券空头'}
               {position.collateral ? ` · 担保物 ¥${money(position.collateral)}` : ''}
             </span>
@@ -99,10 +103,10 @@ function Positions({ account, onSelect }: { account: Account | null; onSelect: (
           <span className="num">{shares(position.qty)}</span>
           <span className={`num ${position.avail === 0 ? 'text-up' : ''}`}>{shares(position.avail)}</span>
           <span className="num">{priceText(position.avgCost, position.kind === 'etf' ? 1_000 : 10_000)}</span>
-          <span className={`num ${tone(position.pct)}`}>{priceText(position.price, position.kind === 'etf' ? 1_000 : 10_000)}</span>
+          <PriceCell value={position.price} tick={position.kind === 'etf' ? 1_000 : 10_000} className={tone(position.pct)} />
           <span className="num">{money(position.value)}</span>
           <span className={`num ${tone(position.pnl)}`}>
-            {money(position.pnl)}<span className="ml-1 text-[10px]">{percent(position.pnlPct)}</span>
+            {money(position.pnl)}<span className="ml-1 text-[0.6875rem]">{percent(position.pnlPct)}</span>
           </span>
           <span className={`num ${tone(position.dayPnl)}`}>{money(position.dayPnl)}</span>
         </button>
@@ -117,25 +121,27 @@ function Orders({ orders, today, onCancel }: { orders: OrderRow[]; today: string
     <div>
       <Head cols={cols} />
       {orders.map((order) => (
-        <div key={order.id} className="grid items-center gap-2 border-b border-hairline/40 px-3 py-2 text-xs"
+        <div key={order.id} className="dense-row grid items-center gap-2 border-b border-hairline/40 px-3 text-xs"
           style={{ ...minWidth(cols), gridTemplateColumns: cols.map(() => 'minmax(0,1fr)').join(' ') }}>
           <span className="num text-ink-dim">{clockTime(order.created_at)}</span>
-          <span className="truncate">{order.name}<span className="num ml-1 text-[10px] text-ink-dim">{order.code}</span></span>
+          <span className="truncate">{order.name}<span className="num ml-1 text-[0.6875rem] text-ink-dim">{order.code}</span></span>
           <span className={order.side.includes('short') || order.side === 'cover_buy' ? 'text-down' : 'text-foreground'}>
             {SIDE_LABEL[order.side] ?? order.side}
           </span>
           <span className="num">{order.leaf > 1 ? `${order.leaf}×` : '—'}</span>
           <span className="num">{shares(order.qty)}</span>
           <span className="num">{order.limitPrice ? priceText(order.limitPrice, order.kind === 'etf' ? 1_000 : 10_000) : '市价'}</span>
-          <span className={order.status === 'rejected' ? 'text-up' : order.status === 'canceled' ? 'text-ink-dim' : 'text-primary'}>
+          <span className={`chip justify-self-start ${order.status === 'rejected' ? 'border-up/40 bg-up/12 text-up'
+            : order.status === 'canceled' ? 'border-hairline text-ink-dim'
+              : order.source === 'system' ? 'border-warn/45 bg-warn/12 text-warn' : 'border-info/40 bg-info/12 text-info'}`}>
             {STATUS_LABEL[order.status] ?? order.status}
           </span>
           <span className="flex items-center gap-2">
-            <em className="min-w-0 flex-1 truncate not-italic text-[11px] text-ink-dim" title={order.reason}>
+            <em className="min-w-0 flex-1 truncate not-italic text-[0.75rem] text-ink-dim" title={order.reason}>
               {order.source === 'system' ? '⚠ ' : ''}{order.reason || (order.day > today ? `预埋 · 归属 ${order.day}` : '等待撮合')}
             </em>
             {order.source !== 'system' && order.status === 'open' && (
-              <Button size="xs" variant="ghost" className="h-6 shrink-0 px-2 text-[11px]"
+              <Button size="xs" variant="ghost" className="h-6 shrink-0 px-2 text-[0.75rem]"
                 onClick={() => onCancel(order.id)}>撤单</Button>
             )}
           </span>
@@ -151,11 +157,13 @@ function Fills({ trades }: { trades: TradeRow[] }) {
     <div>
       <Head cols={cols} />
       {trades.map((trade) => (
-        <div key={trade.id} className="grid gap-2 border-b border-hairline/40 px-3 py-2 text-xs"
+        <div key={trade.id} className="dense-row grid gap-2 border-b border-hairline/40 px-3 text-xs"
           style={{ ...minWidth(cols), gridTemplateColumns: cols.map(() => 'minmax(0,1fr)').join(' ') }}>
           <span className="num text-ink-dim">{dayTime(trade.created_at)}</span>
           <span className="truncate">{trade.name}</span>
-          <span className={SIDE_LABEL[trade.side]?.includes('卖') ? 'text-down' : 'text-up'}>{SIDE_LABEL[trade.side] ?? trade.side}</span>
+          <span className={`chip justify-self-start ${BUY_SIDE_SET.has(trade.side) ? 'border-up/35 bg-up/10 text-up' : 'border-down/35 bg-down/10 text-down'}`}>
+            {SIDE_LABEL[trade.side] ?? trade.side}
+          </span>
           <span className="num">{shares(trade.qty)}</span>
           <span className="num">{priceText(trade.price, trade.kind === 'etf' ? 1_000 : 10_000)}</span>
           <span className="num">{money(trade.amount)}</span>
@@ -174,7 +182,7 @@ function Notes({ events }: { events: { kind: string; message: string; at: string
         <li key={`${event.at}-${index}`}
           className={`rounded border px-3 py-2 leading-6 ${event.kind === 'liquidation'
             ? 'border-up/40 bg-up/10 text-up' : event.kind === 'call' ? 'border-primary/40 bg-primary/10 text-primary' : 'border-hairline text-muted-foreground'}`}>
-          <span className="num mr-2 text-[10px] opacity-70">{clockTime(event.at)}</span>
+          <span className="num mr-2 text-[0.6875rem] opacity-70">{clockTime(event.at)}</span>
           {event.message}
         </li>
       ))}
@@ -200,7 +208,7 @@ function Risk({ account, curve, leader, startCash }: {
           <p className={`num text-3xl ${ratio === null ? 'text-muted-foreground' : ratio < 1.3 ? 'text-up' : ratio < 1.5 ? 'text-primary' : 'text-down'}`}>
             {ratioText(ratio)}
           </p>
-          <p className="text-[11px] text-ink-dim">
+          <p className="text-[0.75rem] text-ink-dim">
             {ratio === null ? '当前无负债，普通现货交易'
               : ratio < 1.3 ? '已低于平仓线 130%，系统正在强制平仓'
                 : ratio < 1.4 ? '低于追保线 140%，请尽快追加担保物'
@@ -214,7 +222,7 @@ function Risk({ account, curve, leader, startCash }: {
             <span key={line} className="absolute inset-y-0 w-px bg-foreground/30" style={{ left: `${((line - 1.1) / 1.5) * 100}%` }} />
           ))}
         </div>
-        <div className="flex justify-between text-[10px] text-ink-dim"><span>110%</span><span>平仓 130%</span><span>追保 140%</span><span>预警 150%</span><span>260%+</span></div>
+        <div className="flex justify-between text-[0.6875rem] text-ink-dim"><span>110%</span><span>平仓 130%</span><span>追保 140%</span><span>预警 150%</span><span>260%+</span></div>
 
         <dl className="grid grid-cols-2 gap-x-5 gap-y-1.5 pt-1 text-xs sm:grid-cols-3">
           <Cell label="总资产" value={money(account?.totalAssets ?? 0)} />
@@ -243,7 +251,7 @@ function Risk({ account, curve, leader, startCash }: {
         <div>
           <h3 className="mb-2 text-xs tracking-wide text-muted-foreground">今日盈亏榜</h3>
           {leader.length === 0 ? (
-            <p className="rounded border border-dashed border-hairline px-3 py-6 text-center text-[11px] leading-5 text-ink-dim">
+            <p className="rounded border border-dashed border-hairline px-3 py-6 text-center text-[0.75rem] leading-5 text-ink-dim">
               排行榜在每日日结后生成。多次同步会持续更新当日快照。
             </p>
           ) : (
@@ -268,7 +276,7 @@ function Risk({ account, curve, leader, startCash }: {
 function Cell({ label, value, warn, toneValue }: { label: string; value: string; warn?: boolean; toneValue?: number }) {
   return (
     <div className="flex flex-col">
-      <span className="text-[10px] text-ink-dim">{label}</span>
+      <span className="text-[0.6875rem] text-ink-dim">{label}</span>
       <span className={`num ${toneValue !== undefined ? tone(toneValue) : warn ? 'text-primary' : ''}`}>{value}</span>
     </div>
   );

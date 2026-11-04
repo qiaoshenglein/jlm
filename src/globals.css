@@ -18,54 +18,67 @@
   scrollbar-gutter: stable;
 }
 
+/* 数字一律等宽表格数字：跳动时列宽不抖 */
 @utility num {
   font-family: var(--font-mono);
   font-variant-numeric: tabular-nums;
-  letter-spacing: -0.01em;
+  letter-spacing: 0;
 }
 
-/* 交易台配色：深色底、红涨绿跌（A 股惯例）、琥珀色作为唯一强调色 */
+/* 交易台配色：深色底、红涨绿跌（A 股惯例）、琥珀作为唯一品牌强调色 */
 :root {
-  --background: #070b12;
-  --foreground: #dbe6f3;
-  --card: #0c1220;
-  --card-foreground: #dbe6f3;
-  --popover: #0e1626;
-  --popover-foreground: #dbe6f3;
+  --background: #060a11;
+  --foreground: #e4ecf7;
+  --card: #0b1220;
+  --card-foreground: #e4ecf7;
+  --popover: #0e1728;
+  --popover-foreground: #e4ecf7;
   --primary: #ffb020;
   --primary-foreground: #1a1206;
   --secondary: #16202f;
-  --secondary-foreground: #c9d6e6;
+  --secondary-foreground: #d3dfef;
   --muted: #131c2a;
-  --muted-foreground: #7b8ca6;
+  --muted-foreground: #97a7bd;
   --accent: #17222f;
-  --accent-foreground: #e6eefb;
+  --accent-foreground: #e8f0fb;
   --destructive: #ff3b4b;
-  --border: #1c2637;
-  --input: #223046;
+  --border: #1e2a3c;
+  --input: #263650;
   --ring: #ffb020;
   --chart-1: #ffb020;
   --chart-2: #38bdf8;
   --chart-3: #12bd85;
   --chart-4: #ff3b4b;
   --chart-5: #8e51ff;
-  --radius: 0.5rem;
+  --radius: 0.625rem;
   --sidebar: #0a101a;
-  --sidebar-foreground: #dbe6f3;
+  --sidebar-foreground: #e4ecf7;
   --sidebar-primary: #ffb020;
   --sidebar-primary-foreground: #1a1206;
   --sidebar-accent: #16202f;
-  --sidebar-accent-foreground: #dbe6f3;
-  --sidebar-border: #1c2637;
+  --sidebar-accent-foreground: #e4ecf7;
+  --sidebar-border: #1e2a3c;
   --sidebar-ring: #ffb020;
 
-  --up: #ff3b4b;
-  --down: #12bd85;
-  --flat: #8a97a8;
-  --panel: #0b1220;
-  --panel-raised: #101a2b;
+  /* 表面层级：页面 → 面板 → 内嵌块 → 悬停，逐级提亮 */
+  --surface-0: #060a11;
+  --surface-1: #0a1120;
+  --surface-2: #0f1a2b;
+  --surface-3: #162336;
+
+  --up: #ff4d57;
+  --down: #16c98d;
+  --flat: #8b98ab;
+  --warn: #ffb020;
+  --danger: #ff5462;
+  --info: #48c6f8;
+
   --hairline: #1b2636;
-  --ink-dim: #64748b;
+  --ink-dim: #8b9cb4;
+
+  --panel: var(--surface-1);
+  --panel-raised: var(--surface-2);
+  --shadow-panel: 0 1px 0 0 #ffffff09 inset, 0 18px 40px -30px #000000d8;
 }
 
 @theme inline {
@@ -90,7 +103,13 @@
   --color-up: var(--up);
   --color-down: var(--down);
   --color-flat: var(--flat);
+  --color-warn: var(--warn);
+  --color-danger: var(--danger);
+  --color-info: var(--info);
   --color-panel: var(--panel);
+  --color-surface-1: var(--surface-1);
+  --color-surface-2: var(--surface-2);
+  --color-surface-3: var(--surface-3);
   --color-raised: var(--panel-raised);
   --color-hairline: var(--hairline);
   --color-ink-dim: var(--ink-dim);
@@ -117,21 +136,147 @@
 
 html {
   color-scheme: dark;
+  font-size: 16px;
+  -webkit-text-size-adjust: 100%;
 }
+
+/* 行距密度：三档用显式像素定义，不依赖根字号（部分环境会强制根字号，导致 rem 方案失效） */
+.dense-row { padding-block: 6px; }
+.dense-pad { padding: 10px 12px; }
+.dense-title { font-size: 13px; }
+
+html[data-density='compact'] .dense-row { padding-block: 3px; font-size: 12px; }
+html[data-density='compact'] .dense-pad { padding: 6px 10px; }
+html[data-density='compact'] .dense-title { font-size: 12px; }
+
+html[data-density='roomy'] .dense-row { padding-block: 9px; font-size: 14px; }
+html[data-density='roomy'] .dense-pad { padding: 14px 14px; }
+html[data-density='roomy'] .dense-title { font-size: 14px; }
+
+/* 手感：Tailwind v4 的 preflight 把按钮光标改成 default，交易台必须一眼看出「这里能点」 */
+button:not(:disabled),
+[role="button"]:not([aria-disabled="true"]) {
+  cursor: pointer;
+}
+
+button:disabled {
+  cursor: not-allowed;
+}
+
+a,
+button,
+input,
+label,
+[role="button"],
+[role="tab"] {
+  -webkit-tap-highlight-color: transparent;
+  touch-action: manipulation; /* 去掉移动端双击缩放带来的约 300ms 点击延迟 */
+}
+
+/* 翻页与切视图用极短的位移淡入，让“动作发生了”被看见，但不拖慢节奏 */
+@keyframes page-in {
+  from { opacity: 0.4; transform: translateY(3px); }
+  to { opacity: 1; transform: none; }
+}
+
+.page-in { animation: page-in 120ms ease-out 1; }
+
+@keyframes view-in {
+  from { opacity: 0.5; transform: translateY(6px); }
+  to { opacity: 1; transform: none; }
+}
+
+.view-in { animation: view-in 140ms ease-out 1; }
+
+@media (prefers-reduced-motion: reduce) {
+  .page-in,
+  .view-in {
+    animation: none;
+  }
+}
+
+/* 行情列表行高显式固定：一页有几行就有多高，空行占位与真实行同高，切换分类不会让面板抽跳 */
+html { --list-row: 44px; }
+html[data-density='compact'] { --list-row: 38px; }
+html[data-density='roomy'] { --list-row: 52px; }
+.list-row { height: var(--list-row); }
 
 body {
   background:
-    radial-gradient(120% 80% at 12% -10%, #10203a 0%, transparent 55%),
-    radial-gradient(90% 70% at 100% 0%, #1a1408 0%, transparent 60%),
+    radial-gradient(115% 70% at 8% -12%, #10233f 0%, transparent 52%),
+    radial-gradient(80% 60% at 100% -6%, #1b1408 0%, transparent 58%),
     var(--background);
   color: var(--foreground);
   font-family: var(--font-sans);
+  font-size: 13px;
   -webkit-font-smoothing: antialiased;
+  -webkit-tap-highlight-color: transparent;
+  overscroll-behavior-y: none;
 }
 
-/* 行情数字用等宽表格数字，跳动时列宽不抖 */
-.num {
-  font-variant-numeric: tabular-nums;
+::selection {
+  background: color-mix(in oklab, var(--primary) 35%, transparent);
+}
+
+/* 面板与标题栏：统一层级与边框，不再到处手写 */
+.panel {
+  background: color-mix(in oklab, var(--surface-1) 94%, transparent);
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-panel);
+}
+
+.panel-hd {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.5rem 0.75rem;
+  border-bottom: 1px solid var(--hairline);
+  font-size: 12.5px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+}
+
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  border-radius: 999px;
+  padding: 0.1rem 0.5rem;
+  font-size: 11.5px;
+  line-height: 1.6;
+  border: 1px solid transparent;
+}
+
+.grid-lines {
+  background-image:
+    linear-gradient(to right, color-mix(in oklab, var(--hairline) 60%, transparent) 1px, transparent 1px),
+    linear-gradient(to bottom, color-mix(in oklab, var(--hairline) 60%, transparent) 1px, transparent 1px);
+  background-size: 40px 32px;
+}
+
+/* 行情跳动：只改背景，绝不改变尺寸，保证零位移 */
+@keyframes flash-up {
+  0% { background-color: color-mix(in oklab, var(--up) 34%, transparent); }
+  100% { background-color: transparent; }
+}
+@keyframes flash-down {
+  0% { background-color: color-mix(in oklab, var(--down) 34%, transparent); }
+  100% { background-color: transparent; }
+}
+.flash-up { animation: flash-up 800ms ease-out 1; }
+.flash-down { animation: flash-down 800ms ease-out 1; }
+
+/* 加载微光：只有透明度变化，不影响布局 */
+@keyframes skel {
+  0% { opacity: 0.35; }
+  50% { opacity: 0.72; }
+  100% { opacity: 0.35; }
+}
+.skel {
+  background: linear-gradient(90deg, var(--surface-2), var(--hairline));
+  border-radius: 4px;
+  animation: skel 1.4s ease-in-out infinite;
 }
 
 .tape {
@@ -142,38 +287,27 @@ body {
   to { transform: translateX(-50%); }
 }
 
-@keyframes flash-up {
-  0% { background-color: color-mix(in oklab, var(--up) 28%, transparent); }
-  100% { background-color: transparent; }
-}
-@keyframes flash-down {
-  0% { background-color: color-mix(in oklab, var(--down) 28%, transparent); }
-  100% { background-color: transparent; }
-}
-.flash-up { animation: flash-up 900ms ease-out 1; }
-.flash-down { animation: flash-down 900ms ease-out 1; }
-
-.grid-lines {
-  background-image:
-    linear-gradient(to right, color-mix(in oklab, var(--hairline) 60%, transparent) 1px, transparent 1px),
-    linear-gradient(to bottom, color-mix(in oklab, var(--hairline) 60%, transparent) 1px, transparent 1px);
-  background-size: 40px 32px;
+/* 跑马灯在悬停或聚焦时停下，方便读数和点选 */
+.tape-wrap:hover .tape,
+.tape-wrap:focus-within .tape {
+  animation-play-state: paused;
 }
 
-/* 底部导航避开刘海/Home 指示条，并禁止下拉刷新抖动 */
+/* 底部导航避开刘海与 Home 指示条 */
 .nav-safe {
   padding-bottom: max(0.25rem, env(safe-area-inset-bottom));
 }
 
-html {
-  -webkit-text-size-adjust: 100%;
-}
+/* 尊重系统的减弱动效偏好：跑马灯、闪烁、微光全部静止 */
+@media (prefers-reduced-motion: reduce) {
+  .tape,
+  .flash-up,
+  .flash-down,
+  .skel {
+    animation: none !important;
+  }
 
-body {
-  -webkit-tap-highlight-color: transparent;
-  overscroll-behavior-y: none;
-}
-
-::selection {
-  background: color-mix(in oklab, var(--primary) 35%, transparent);
+  * {
+    transition-duration: 1ms !important;
+  }
 }

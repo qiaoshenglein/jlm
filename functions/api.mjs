@@ -19,7 +19,7 @@ const json = (body, status = 200) => Response.json(body, {
 const bad = (code, status = 400) => json({ ok: false, code }, status);
 
 const READ_ACTIONS = new Set(['board', 'sync', 'me', 'chart', 'leader', 'rules', 'lookup', 'search']);
-const WRITE_ACTIONS = new Set(['register', 'login', 'logout', 'order', 'cancel', 'preview', 'watch_add', 'watch_remove']);
+const WRITE_ACTIONS = new Set(['register', 'login', 'logout', 'order', 'cancel', 'preview', 'watch_add', 'watch_remove', 'watch_sort']);
 
 const UNAUTHED = () => Object.assign(new Error('login_required'), { code: 'login_required', status: 401 });
 
@@ -132,6 +132,7 @@ export async function handle({ request, supabase }) {
       case 'cancel': return await cancelAction(store, { request, body, url, nowMs });
       case 'watch_add': return await watchAction(store, 'add', { request, body, url, nowMs, now });
       case 'watch_remove': return await watchAction(store, 'remove', { request, body, url, nowMs, now });
+      case 'watch_sort': return await watchSortAction(store, { request, body, url, nowMs });
       default: return bad('not_found', 404);
     }
   } catch (error) {
@@ -474,7 +475,8 @@ async function orderAction(store, previewOnly, { request, body, url, nowMs, toda
     side: clampText(body.side, 16), secid,
     mode: body.mode === 'limit' ? 'limit' : 'market',
     qty: Math.trunc(Number(body.qty)),
-    limitPrice: rawLimit === null || rawLimit === undefined || rawLimit === '' ? null : Math.trunc(Number(rawLimit) * MICRO),
+    // 价格来自用户输入的十进制字符串：必须四舍五入，trunc 会把 4.06×1e6 削成 4059999
+    limitPrice: rawLimit === null || rawLimit === undefined || rawLimit === '' ? null : Math.round(Number(rawLimit) * MICRO),
     leaf: Math.trunc(Number(body.leaf ?? 1)),
   };
 
@@ -511,6 +513,18 @@ async function orderAction(store, previewOnly, { request, body, url, nowMs, toda
   });
 }
 
+async function watchSortAction(store, { request, body, url, nowMs }) {
+  const user = await requireUser(store, tokenOf(body, url.searchParams, request), nowMs);
+  const list = Array.isArray(body.secids) ? body.secids.slice(0, 80) : [];
+  if (!list.length) return bad('symbol_invalid');
+  const rows = await store.listWatch(user.id);
+  const known = new Set(rows.map((row) => row.secid));
+  const clean = list.filter((secid) => typeof secid === 'string' && known.has(secid));
+  if (clean.length === 0) return bad('order_invalid');
+  await store.sortWatch(user.id, clean.map((secid, index) => ({ secid, sort: (index + 1) * 1000 })));
+  return json({ ok: true, watch: await store.listWatch(user.id) });
+}
+
 async function watchAction(store, mode, { request, body, url, nowMs, now }) {
   const user = await requireUser(store, tokenOf(body, url.searchParams, request), nowMs);
   const secid = clampText(body.secid, 12);
@@ -520,9 +534,11 @@ async function watchAction(store, mode, { request, body, url, nowMs, now }) {
     const quotes = await getQuotes(false, now).catch(() => new Map());
     const quote = quotes.get(secid) ?? await ensureQuote(secid, quotes, now);
     if (!quote) return bad('unknown_symbol', 404);
+    const rows = await store.listWatch(user.id);
+    const top = rows.reduce((max, row) => Math.max(max, Number(row.sort) || 0), 0);
     await store.addWatch({
       id: newId(), user_id: user.id, secid, code: quote.code, name: quote.name, kind: quote.kind,
-      created_at: new Date(nowMs).toISOString(),
+      sort: top + 1000, created_at: new Date(nowMs).toISOString(),
     });
   } else {
     await store.removeWatch(user.id, secid);

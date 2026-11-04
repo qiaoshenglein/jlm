@@ -222,8 +222,41 @@ export async function ensureQuote(secid, quotes, now = new Date()) {
   }
 }
 
+// 图表缓存：分时 20 秒、日 K 5 分钟，同标的并发请求合并。
+// 前端会预取悬停与相邻标的，没有这一层就会把上游打爆、把点击拖慢。
+const TRENDS_TTL = 20_000;
+const KLINE_TTL = 300_000;
+const NEGATIVE_TTL = 5_000;
+const charts = new Map();
+const chartFlights = new Map();
+
+function cachedChart(key, ttl, loader) {
+  const hit = charts.get(key);
+  if (hit && Date.now() - hit.at < (hit.data ? ttl : NEGATIVE_TTL)) return Promise.resolve(hit.data);
+  const flying = chartFlights.get(key);
+  if (flying) return flying;
+  const task = (async () => {
+    try {
+      const data = await loader();
+      charts.set(key, { at: Date.now(), data });
+      if (charts.size > 400) {
+        for (const [stale] of [...charts.entries()].sort((a, b) => a[1].at - b[1].at).slice(0, 200)) charts.delete(stale);
+      }
+      return data;
+    } finally {
+      chartFlights.delete(key);
+    }
+  })();
+  chartFlights.set(key, task);
+  return task;
+}
+
 // 当日分时：用于分时图与「行情是否新鲜」的判定
-export async function trendsOf(secid) {
+export function trendsOf(secid) {
+  return cachedChart(`trends:${secid}`, TRENDS_TTL, () => fetchTrends(secid));
+}
+
+async function fetchTrends(secid) {
   const url = `${TRENDS_URL}?secid=${secid}&fields1=f1,f2,f3,f4,f5,f6,f7,f8&fields2=f51,f53,f56,f58&iscr=0&ndays=1`;
   const body = await getJson(url, 5_000);
   const d = body.data;
@@ -239,7 +272,11 @@ export async function trendsOf(secid) {
 }
 
 // 日 K：用于蜡烛图与均线
-export async function klineOf(secid, count = 120) {
+export function klineOf(secid, count = 120) {
+  return cachedChart(`kline:${secid}:${count}`, KLINE_TTL, () => fetchKline(secid, count));
+}
+
+async function fetchKline(secid, count) {
   const url = `${KLINE_URL}?secid=${secid}&fields1=f1,f2,f3,f4,f5,f6&fields2=f51,f52,f53,f54,f55,f56&klt=101&fqt=1&lmt=${count}&end=20500101`;
   const body = await getJson(url, 5_000);
   const d = body.data;

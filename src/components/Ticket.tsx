@@ -8,13 +8,16 @@ import {
 } from '../format';
 
 const DIRS = [
-  { side: 'buy', label: '担保品买入', hint: '用自有资金买入，T+1 可卖' },
-  { side: 'sell', label: '担保品卖出', hint: '卖出自有持仓提取资金' },
-  { side: 'margin_buy', label: '融资买入', hint: '借钱加杠杆做多' },
-  { side: 'sell_repay', label: '卖券还款', hint: '卖出并偿还融资负债' },
-  { side: 'short_sell', label: '融券卖出', hint: '借券做空' },
-  { side: 'cover_buy', label: '买券还券', hint: '买回归还融券负债' },
+  { side: 'buy', label: '担保品买入', hint: '用自有资金买入，T+1 可卖', group: 'cash' },
+  { side: 'sell', label: '担保品卖出', hint: '卖出自有持仓并提取资金', group: 'cash' },
+  { side: 'margin_buy', label: '融资买入', hint: '借钱加杠杆做多', group: 'credit' },
+  { side: 'sell_repay', label: '卖券还款', hint: '卖出并优先偿还融资负债', group: 'credit' },
+  { side: 'short_sell', label: '融券卖出', hint: '借券做空，卖出所得冻结为担保物', group: 'credit' },
+  { side: 'cover_buy', label: '买券还券', hint: '买回归还融券负债', group: 'credit' },
 ] as const;
+
+// A 股惯例：买入类红、卖出类绿，按钮配色与语义一致
+export const BUY_SIDES = new Set(['buy', 'margin_buy', 'cover_buy']);
 
 const LEAVE_LABEL = (leaf: number) => (leaf === 1 ? '1×' : `${leaf}×`);
 
@@ -36,11 +39,13 @@ export function Ticket({ quote, account, held, onFilled, onResolve, onDuplicate,
   const [preview, setPreview] = useState<Preview | null>(null);
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
+  const [pending, setPending] = useState(false);
   const timer = useRef<number | null>(null);
 
   const leveraged = side === 'margin_buy' || side === 'short_sell';
   const buying = side === 'buy' || side === 'margin_buy';
-  const indexOnly = quote?.kind === 'index'; // 指数不可直接交易，不再发注定被拒的试算请求
+  const indexOnly = quote?.kind === 'index';
+  const buySide = BUY_SIDES.has(side); // 指数不可直接交易，不再发注定被拒的试算请求
   const qty = Math.trunc(Number(qtyText) || 0);
   const activeDir = DIRS.find((dir) => dir.side === side);
   const position = account?.positions.find((p) => p.symbol === quote?.secid);
@@ -63,18 +68,20 @@ export function Ticket({ quote, account, held, onFilled, onResolve, onDuplicate,
   const lastPrice = quote?.last ?? 0;
   const seq = useRef(0);
   useEffect(() => {
-    if (!secid || qty <= 0 || indexOnly) { setPreview(null); return; }
+    if (!secid || qty <= 0 || indexOnly) { setPreview(null); setPending(false); return; }
     if (timer.current) window.clearTimeout(timer.current);
     const request = ++seq.current;
+    setPending(true);
     timer.current = window.setTimeout(async () => {
       try {
         const result = await api<{ preview: Preview }>('preview', {
           side, secid, qty, mode, leaf: leveraged ? leaf : 1,
           limitPrice: mode === 'limit' ? priceText_ : null,
         }, true);
-        if (request === seq.current) { setPreview(result.preview); setError(''); }
+        if (request === seq.current) { setPreview(result.preview); setError(''); setPending(false); }
       } catch (caught) {
         if (request !== seq.current) return;
+        setPending(false);
         if (caught instanceof ApiError && !['network_error', 'invalid_response', 'server_error', 'read_failed'].includes(caught.code)) {
           setError(caught.message);
         }
@@ -82,6 +89,36 @@ export function Ticket({ quote, account, held, onFilled, onResolve, onDuplicate,
     }, 420);
     return () => { if (timer.current) window.clearTimeout(timer.current); };
   }, [secid, lastPrice, side, qty, mode, leaf, priceText_, leveraged, indexOnly]);
+
+  function pickSide(value: string) {
+    setSide(value);
+    setError('');
+    setLeaf(value === 'margin_buy' || value === 'short_sell' ? (leaf > 1 ? leaf : 2) : 1);
+  }
+
+  // 手不离键盘：b/s 切方向，1-5 切杠杆，Enter 下单（数量框内同样有效）
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if (event.metaKey || event.ctrlKey || event.altKey || event.repeat || !quote) return;
+      const target = event.target as HTMLElement | null;
+      const typing = Boolean(target && (/^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName) || target.isContentEditable));
+      if (event.key === 'Enter') {
+        if (typing && target?.id !== 'order-qty') return;
+        event.preventDefault();
+        void submit();
+        return;
+      }
+      if (typing) return;
+      if (event.key === 'b' || event.key === 'B') { pickSide(buySide ? 'sell' : 'buy'); return; }
+      if (event.key === 's' || event.key === 'S') { pickSide(buySide ? 'margin_buy' : 'short_sell'); return; }
+      if (/^[1-5]$/.test(event.key)) {
+        const value = Number(event.key);
+        if (leveraged || value === 1) setLeaf(value);
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  });
 
   async function submit(confirmDuplicate = false) {
     if (!quote || busy) return;
@@ -107,10 +144,10 @@ export function Ticket({ quote, account, held, onFilled, onResolve, onDuplicate,
   }
 
   return (
-    <div className="flex h-full flex-col rounded-lg border border-hairline bg-panel">
-      <header className="flex items-center justify-between border-b border-hairline px-4 py-2.5">
-        <h2 className="text-sm font-medium tracking-wide">下单</h2>
-        <span className="num text-[11px] text-ink-dim">虚拟资金</span>
+    <div className="panel flex h-full flex-col overflow-hidden">
+      <header className="panel-hd shrink-0 justify-between">
+        <h2>下单</h2>
+        <span className="chip border-hairline text-ink-dim">虚拟资金</span>
       </header>
 
       <div className="scrollbar-thin min-h-0 flex-1 space-y-3 overflow-y-auto p-4">
@@ -129,15 +166,18 @@ export function Ticket({ quote, account, held, onFilled, onResolve, onDuplicate,
         </div>
 
         {quote ? (
-          <div className="flex items-baseline justify-between rounded border border-hairline/70 bg-raised px-3 py-2">
-            <div>
-              <p className="text-sm">{quote.name}<span className="num ml-2 text-xs text-ink-dim">{quote.code}</span></p>
-              <p className="text-[11px] text-ink-dim">
-                {quote.kind === 'etf' ? '场内 ETF' : '股票'} · 涨跌停 {percent(quote.limitRatio * 100, 0)} · T+1
-              </p>
+          <div className={`rounded-md border px-3 py-2 ${buySide ? 'border-up/35 bg-up/8' : 'border-down/35 bg-down/8'}`}>
+            <div className="flex items-baseline justify-between gap-2">
+              <p className="truncate text-[0.9375rem] font-medium">{quote.name}
+                <span className="num ml-2 text-[0.75rem] text-ink-dim">{quote.code}</span></p>
+              <p className={`num shrink-0 text-[1.375rem] leading-none ${tone(quote.pct)}`}>{priceText(quote.last, quote.tick)}</p>
             </div>
-            <p className={`num text-lg ${tone(quote.pct)}`}>{priceText(quote.last, quote.tick)}
-              <span className="ml-2 text-xs">{percent(quote.pct)}</span></p>
+            <div className="mt-1 flex items-center justify-between gap-2">
+              <p className="text-[0.75rem] text-ink-dim">
+                {quote.kind === 'etf' ? '场内 ETF' : '股票'} · 涨跌停 {percent(quote.limitRatio * 100, 0)} · T+1 交收
+              </p>
+              <p className={`num text-[0.8125rem] ${tone(quote.pct)}`}>{percent(quote.pct)}</p>
+            </div>
           </div>
         ) : (
           <p className="rounded border border-dashed border-hairline px-3 py-6 text-center text-xs text-ink-dim">
@@ -145,24 +185,33 @@ export function Ticket({ quote, account, held, onFilled, onResolve, onDuplicate,
           </p>
         )}
 
-        <div role="group" aria-label="交易方向" className="grid grid-cols-3 gap-1.5">
-          {DIRS.map((dir) => (
-            <button key={dir.side} type="button" title={dir.hint} disabled={!quote}
-              onClick={() => { setSide(dir.side); if (dir.side !== 'margin_buy' && dir.side !== 'short_sell') setLeaf(1); else setLeaf((v) => v || 2); }}
-              aria-pressed={side === dir.side}
-              className={`rounded border px-2 py-2 text-xs transition disabled:opacity-40 ${side === dir.side
-                ? 'border-primary/70 bg-primary/15 text-primary'
-                : 'border-hairline text-muted-foreground hover:border-input hover:text-foreground'}`}>
-              {dir.label}
-            </button>
-          ))}
-        </div>
-        <p className="text-[11px] leading-5 text-ink-dim">{activeDir?.hint}</p>
+        {([['现货（自有资金）', DIRS.filter((dir) => dir.group === 'cash')],
+          ['信用（可用杠杆）', DIRS.filter((dir) => dir.group === 'credit')]] as const).map(([group, list]) => (
+          <fieldset key={group} className="space-y-1">
+            <legend className="mb-1 text-[0.6875rem] tracking-[0.08em] text-ink-dim">{group}</legend>
+            <div role="group" aria-label="交易方向" className="grid grid-cols-2 gap-1.5">
+              {list.map((dir) => {
+                const isBuy = BUY_SIDES.has(dir.side);
+                const on = side === dir.side;
+                return (
+                  <button key={dir.side} type="button" title={dir.hint} disabled={!quote} onClick={() => pickSide(dir.side)}
+                    aria-pressed={on}
+                    className={`rounded-md border px-2 py-2 text-left text-[0.8125rem] transition-colors duration-75 active:translate-y-px disabled:opacity-40 ${on
+                      ? isBuy ? 'border-up bg-up/14 text-up' : 'border-down bg-down/14 text-down'
+                      : 'border-hairline text-muted-foreground hover:border-input hover:text-foreground'}`}>
+                    {dir.label}
+                  </button>
+                );
+              })}
+            </div>
+          </fieldset>
+        ))}
+        <p className="text-[0.75rem] leading-5 text-ink-dim">{activeDir?.hint}</p>
 
         <div role="group" aria-label="委托类型" className="flex gap-1.5">
           {(['market', 'limit'] as const).map((value) => (
             <button key={value} type="button" onClick={() => setMode(value)} aria-pressed={mode === value}
-              className={`flex-1 rounded border py-1.5 text-xs ${mode === value ? 'border-primary/70 text-primary' : 'border-hairline text-muted-foreground'}`}>
+              className={`flex-1 rounded border py-1.5 text-xs transition-colors duration-75 active:translate-y-px ${mode === value ? 'border-primary/70 text-primary' : 'border-hairline text-muted-foreground hover:text-foreground'}`}>
               {value === 'market' ? '市价（最新价撮合）' : '限价当日有效'}
             </button>
           ))}
@@ -170,11 +219,11 @@ export function Ticket({ quote, account, held, onFilled, onResolve, onDuplicate,
 
         {mode === 'limit' && quote && (
           <div className="space-y-1.5">
-            <label className="text-[11px] text-muted-foreground" htmlFor="limit-price">委托价格</label>
+            <label className="text-[0.75rem] text-muted-foreground" htmlFor="limit-price">委托价格</label>
             <Input id="limit-price" className="num h-8" inputMode="decimal" value={priceText_}
               placeholder={priceText(quote.last, quote.tick)}
               onInput={(event) => setPriceText((event.target as HTMLInputElement).value)} />
-            <div className="flex gap-1.5 text-[11px]">
+            <div className="flex gap-1.5 text-[0.75rem]">
               <button type="button" className="rounded border border-hairline px-2 py-1 hover:border-input"
                 onClick={() => setPriceText((quote.last / Y).toFixed(quote.tick === 1_000 ? 3 : 2))}>最新</button>
               <button type="button" className="rounded border border-hairline px-2 py-1 text-up hover:border-input"
@@ -186,12 +235,12 @@ export function Ticket({ quote, account, held, onFilled, onResolve, onDuplicate,
         )}
 
         <div className="space-y-1.5">
-          <label className="text-[11px] text-muted-foreground" htmlFor="order-qty">
+          <label className="text-[0.75rem] text-muted-foreground" htmlFor="order-qty">
             委托数量（股，100 整数倍，上限 100 万）
           </label>
           <Input id="order-qty" className="num h-8" inputMode="numeric" value={qtyText}
             onInput={(event) => setQtyText((event.target as HTMLInputElement).value.replace(/[^\d]/g, ''))} />
-          <div className="flex gap-1.5 text-[11px]">
+          <div className="flex gap-1.5 text-[0.75rem]">
             {(buying
               ? ([['25%', maxBuy * 0.25], ['50%', maxBuy * 0.5], ['75%', maxBuy * 0.75], ['最大', maxBuy]] as [string, number][])
               : ([['可用', sellable], ['一半', sellable * 0.5], ['全部', sellable]] as [string, number][])
@@ -206,7 +255,7 @@ export function Ticket({ quote, account, held, onFilled, onResolve, onDuplicate,
         </div>
 
         <div className="space-y-1.5">
-          <label className="text-[11px] text-muted-foreground">
+          <label className="text-[0.75rem] text-muted-foreground">
             杠杆倍数（保证金比例 {((1 / (leveraged ? leaf : 1)) * 100).toFixed(0)}%）
             {!leveraged && <span className="ml-1 text-ink-dim">· 该方向不使用杠杆</span>}
           </label>
@@ -215,8 +264,8 @@ export function Ticket({ quote, account, held, onFilled, onResolve, onDuplicate,
               <button key={value} type="button" disabled={!leveraged && value > 1}
                 onClick={() => setLeaf(value)} aria-pressed={(leveraged ? leaf : 1) === value}
                 title={!leveraged && value > 1 ? '只有融资买入 / 融券卖出可用杠杆' : undefined}
-                className={`num rounded border py-1.5 text-xs disabled:opacity-35 ${
-                  (leveraged ? leaf : 1) === value ? 'border-primary/70 bg-primary/15 text-primary' : 'border-hairline text-muted-foreground'}`}>
+                className={`num rounded border py-1.5 text-xs transition-colors duration-75 active:translate-y-px disabled:opacity-35 ${
+                  (leveraged ? leaf : 1) === value ? 'border-primary/70 bg-primary/15 text-primary' : 'border-hairline text-muted-foreground hover:border-input hover:text-foreground'}`}>
                 {LEAVE_LABEL(value)}
               </button>
             ))}
@@ -233,7 +282,8 @@ export function Ticket({ quote, account, held, onFilled, onResolve, onDuplicate,
           <Row label="成交后担保比例" value={preview ? ratioText(preview.ratioAfter) : '—'}
             warn={Boolean(preview && preview.ratioAfter !== null && preview.ratioAfter < 1.5)} />
           <Row label="该持仓强平价" value={preview?.liquidationPrice ? priceText(preview.liquidationPrice, quote?.tick) : '—'} warn={Boolean(preview?.liquidationPrice)} />
-          <p className="h-5 text-[11px] leading-5">
+          <p className="flex h-5 items-center gap-2 text-[0.75rem] leading-5">
+            {pending && !indexOnly && <span className="skel inline-block h-2 w-14" aria-hidden="true" />}
             {indexOnly ? <span className="text-primary">指数不可直接交易：改选对应场内 ETF，或在下方输入框输入代码（如 510300）</span>
               : !preview && !error ? <span className="text-ink-dim">{quote ? '试算中…' : '选择标的后自动试算'}</span> : null}
           </p>
@@ -242,20 +292,25 @@ export function Ticket({ quote, account, held, onFilled, onResolve, onDuplicate,
 
       {/* 提交区钉在面板底部：内容高度变化、试算刷新、滚动都不会移动它的位置 */}
       <div className="shrink-0 space-y-2 border-t border-hairline px-4 py-3">
-        <p className="min-h-5 text-[11px] leading-5 text-up" role="status">{error}</p>
-        <Button className="w-full" disabled={!quote || busy || qty <= 0 || indexOnly || Boolean(error)} onClick={() => void submit()}>
-          {busy ? '提交中…' : `${activeDir?.label ?? '下单'} ${shares(qty)} 股`}
-        </Button>
-        <p className="text-[11px] leading-5 text-ink-dim">
+        <p className="min-h-5 text-[0.75rem] leading-5 text-up" role="status">{error}</p>
+        <button type="button" disabled={!quote || busy || qty <= 0 || indexOnly || Boolean(error)} onClick={() => void submit()}
+          className={`flex h-11 w-full items-center justify-center gap-2 rounded-md text-[0.875rem] font-semibold transition-[filter,transform,opacity] duration-75
+            active:translate-y-px
+            disabled:cursor-not-allowed disabled:opacity-45 disabled:active:translate-y-0
+            ${buySide ? 'bg-up text-[#20060a] hover:brightness-110' : 'bg-down text-[#04211a] hover:brightness-110'}`}>
+          <span>{busy ? '提交中…' : `${activeDir?.label ?? '下单'} ${shares(qty)} 股`}</span>
+          {preview && !busy && <span className="num text-[0.75rem] font-normal opacity-80">¥{money(preview.amount)}</span>}
+        </button>
+        <p className="text-[0.75rem] leading-5 text-ink-dim">
           当前可用 ¥{money(account?.cash ?? 0)} · 融资负债 ¥{money(account?.marginBalance ?? 0)} ·
           融券负债 ¥{money(account?.securityBalance ?? 0)}
         </p>
         {held.length > 0 && (
           <div className="flex flex-wrap items-center gap-1.5">
-            <span className="text-[11px] text-ink-dim">持仓速览</span>
+            <span className="text-[0.75rem] text-ink-dim">持仓速览</span>
             {held.map((item) => (
               <button key={item.secid} type="button" onClick={() => void onResolve(item.code)}
-                className={`num rounded border border-hairline px-2 py-1 text-[11px] ${tone(item.pct)} hover:border-input`}>
+                className={`num rounded border border-hairline px-2 py-1 text-[0.75rem] ${tone(item.pct)} hover:border-input`}>
                 {item.name} {percent(item.pct)}
               </button>
             ))}

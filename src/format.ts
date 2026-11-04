@@ -35,7 +35,7 @@ export type TradeRow = {
   qty: number; price: number; amount: number; fee: number; leaf: number; day: string; created_at: string;
 };
 
-export type WatchRow = { secid: string; code: string; name: string; kind: string; created_at: string };
+export type WatchRow = { secid: string; code: string; name: string; kind: string; sort?: number; created_at: string };
 
 export type SearchRow = {
   secid: string; code: string; name: string; kind: 'index' | 'etf' | 'stock';
