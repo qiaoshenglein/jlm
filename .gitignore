@@ -1,0 +1,14 @@
+node_modules/
+dist/
+
+# 自建部署的本地数据库与调试样本，不要提交
+data/
+dev/.local-db.json
+dev/.selftest.db*
+.env
+.env.*
+!.env.example
+.DS_Store
+*.tsbuildinfo
+.qoder-sites/
+.qoder-sites.json

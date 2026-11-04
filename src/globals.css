@@ -1,0 +1,179 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "../vendor/shadcn-tailwind-4.13.0.css";
+
+@utility scrollbar-thin {
+  scrollbar-width: thin;
+}
+
+@utility scrollbar-none {
+  scrollbar-width: none;
+
+  &::-webkit-scrollbar {
+    display: none;
+  }
+}
+
+@utility scrollbar-gutter-stable {
+  scrollbar-gutter: stable;
+}
+
+@utility num {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.01em;
+}
+
+/* 交易台配色：深色底、红涨绿跌（A 股惯例）、琥珀色作为唯一强调色 */
+:root {
+  --background: #070b12;
+  --foreground: #dbe6f3;
+  --card: #0c1220;
+  --card-foreground: #dbe6f3;
+  --popover: #0e1626;
+  --popover-foreground: #dbe6f3;
+  --primary: #ffb020;
+  --primary-foreground: #1a1206;
+  --secondary: #16202f;
+  --secondary-foreground: #c9d6e6;
+  --muted: #131c2a;
+  --muted-foreground: #7b8ca6;
+  --accent: #17222f;
+  --accent-foreground: #e6eefb;
+  --destructive: #ff3b4b;
+  --border: #1c2637;
+  --input: #223046;
+  --ring: #ffb020;
+  --chart-1: #ffb020;
+  --chart-2: #38bdf8;
+  --chart-3: #12bd85;
+  --chart-4: #ff3b4b;
+  --chart-5: #8e51ff;
+  --radius: 0.5rem;
+  --sidebar: #0a101a;
+  --sidebar-foreground: #dbe6f3;
+  --sidebar-primary: #ffb020;
+  --sidebar-primary-foreground: #1a1206;
+  --sidebar-accent: #16202f;
+  --sidebar-accent-foreground: #dbe6f3;
+  --sidebar-border: #1c2637;
+  --sidebar-ring: #ffb020;
+
+  --up: #ff3b4b;
+  --down: #12bd85;
+  --flat: #8a97a8;
+  --panel: #0b1220;
+  --panel-raised: #101a2b;
+  --hairline: #1b2636;
+  --ink-dim: #64748b;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-up: var(--up);
+  --color-down: var(--down);
+  --color-flat: var(--flat);
+  --color-panel: var(--panel);
+  --color-raised: var(--panel-raised);
+  --color-hairline: var(--hairline);
+  --color-ink-dim: var(--ink-dim);
+  --color-chart-1: var(--chart-1);
+  --color-chart-2: var(--chart-2);
+  --color-chart-3: var(--chart-3);
+  --color-chart-4: var(--chart-4);
+  --color-chart-5: var(--chart-5);
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-ring: var(--sidebar-ring);
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+  --font-sans: "PingFang SC", "Microsoft YaHei", "Noto Sans SC", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-mono: ui-monospace, "JetBrains Mono", SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+}
+
+html {
+  color-scheme: dark;
+}
+
+body {
+  background:
+    radial-gradient(120% 80% at 12% -10%, #10203a 0%, transparent 55%),
+    radial-gradient(90% 70% at 100% 0%, #1a1408 0%, transparent 60%),
+    var(--background);
+  color: var(--foreground);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+}
+
+/* 行情数字用等宽表格数字，跳动时列宽不抖 */
+.num {
+  font-variant-numeric: tabular-nums;
+}
+
+.tape {
+  animation: tape 46s linear infinite;
+}
+@keyframes tape {
+  from { transform: translateX(0); }
+  to { transform: translateX(-50%); }
+}
+
+@keyframes flash-up {
+  0% { background-color: color-mix(in oklab, var(--up) 28%, transparent); }
+  100% { background-color: transparent; }
+}
+@keyframes flash-down {
+  0% { background-color: color-mix(in oklab, var(--down) 28%, transparent); }
+  100% { background-color: transparent; }
+}
+.flash-up { animation: flash-up 900ms ease-out 1; }
+.flash-down { animation: flash-down 900ms ease-out 1; }
+
+.grid-lines {
+  background-image:
+    linear-gradient(to right, color-mix(in oklab, var(--hairline) 60%, transparent) 1px, transparent 1px),
+    linear-gradient(to bottom, color-mix(in oklab, var(--hairline) 60%, transparent) 1px, transparent 1px);
+  background-size: 40px 32px;
+}
+
+/* 底部导航避开刘海/Home 指示条，并禁止下拉刷新抖动 */
+.nav-safe {
+  padding-bottom: max(0.25rem, env(safe-area-inset-bottom));
+}
+
+html {
+  -webkit-text-size-adjust: 100%;
+}
+
+body {
+  -webkit-tap-highlight-color: transparent;
+  overscroll-behavior-y: none;
+}
+
+::selection {
+  background: color-mix(in oklab, var(--primary) 35%, transparent);
+}
