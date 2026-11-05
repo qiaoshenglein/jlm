@@ -107,6 +107,20 @@ CREATE TABLE IF NOT EXISTS app.watchlists (
   UNIQUE (user_id, secid)
 );
 
+-- 个人 API 密钥：只存 SHA-256 摘要，明文只在生成那一次返回；revoked_at 非空即失效。
+CREATE TABLE IF NOT EXISTS app.api_keys (
+  id           TEXT PRIMARY KEY,
+  user_id      TEXT NOT NULL,
+  name         TEXT,
+  digest       TEXT NOT NULL UNIQUE,
+  hint         TEXT NOT NULL,
+  created_at   TIMESTAMPTZ NOT NULL,
+  last_used_at TIMESTAMPTZ,
+  revoked_at   TIMESTAMPTZ,
+  calls        BIGINT NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS api_keys_user_idx ON app.api_keys (user_id);
+
 CREATE TABLE IF NOT EXISTS app.settings (
   key        TEXT PRIMARY KEY,
   value      TEXT NOT NULL,

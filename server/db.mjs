@@ -12,7 +12,7 @@ const IDENT = /^[a-z_][a-z0-9_]*$/;
 const HERE = dirname(fileURLToPath(import.meta.url));
 const requireModule = createRequire(import.meta.url);
 
-export const TABLES = ['users', 'sessions', 'orders', 'trades', 'events', 'snapshots', 'watchlists', 'settings', 'audit'];
+export const TABLES = ['users', 'sessions', 'orders', 'trades', 'events', 'snapshots', 'watchlists', 'settings', 'audit', 'api_keys'];
 export const SCHEMA_FILE = { sqlite: 'schema.sqlite.sql', postgres: 'schema.postgres.sql' };
 
 const quote = (name) => {

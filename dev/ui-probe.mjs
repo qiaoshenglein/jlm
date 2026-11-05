@@ -315,7 +315,71 @@ try {
   ok('m-key-toggles-back-to-cn', backToCn.ticket.includes('100 整数倍') && backToCn.header.includes('沪深可用')
     && backToCn.header.includes('美股净资产') && backToCn.overflowX <= 0, backToCn.header.slice(0, 180));
 
-  // 8) mobile shell: smaller page size, everything on screen
+  // 8) API 面板：快捷键打开、生成密钥、示例带上真实密钥与域名
+  const headerBox = await page.evaluate(() => {
+    const head = document.querySelector('header');
+    const row = head.children[0];
+    const tops = [...row.children].map((el) => Math.round(el.getBoundingClientRect().top));
+    return {
+      height: Math.round(head.getBoundingClientRect().height),
+      rows: new Set(tops.map((top) => (top < 30 ? 0 : 1))).size,
+      spread: Math.max(...tops) - Math.min(...tops),
+    };
+  });
+  // 头部金额列本来就是「标签在上、数字在下」两行文字，所以判「有没有换行」看子项顶端是否齐平
+  ok('header-still-single-row-with-api', headerBox.rows === 1 && headerBox.spread <= 8 && headerBox.height <= 92,
+    `height=${headerBox.height} 行=${headerBox.rows} 顶端差=${headerBox.spread}`);
+  await page.keyboard.press('a');
+  await page.waitForFunction(() => document.body.innerText.includes('API 接口与密钥'), null, { timeout: 6_000 });
+  const drawer = page.locator('[role="dialog"][aria-label="API 与密钥"]');
+  ok('api-drawer-opens-on-a-key', (await drawer.count()) === 1
+    && (await page.getByRole('tab', { name: '我的密钥' }).count()) === 1
+    && (await page.getByRole('button', { name: '生成密钥' }).count()) === 1);
+  await page.locator('input[aria-label="密钥备注名"]').fill('探针脚本');
+  await page.getByRole('button', { name: '生成密钥' }).click();
+  await page.waitForFunction(() => /mk_live_[0-9a-f]{32}/.test(document.body.innerText), null, { timeout: 8_000 });
+  const keyPanel = await page.evaluate(() => {
+    const dialog = document.querySelector('[role="dialog"][aria-label="API 与密钥"]');
+    const text = dialog?.innerText ?? '';
+    return {
+      plain: (text.match(/mk_live_[0-9a-f]{32}/) ?? [''])[0],
+      once: text.includes('只显示这一次'),
+      rows: dialog ? dialog.querySelectorAll('tbody tr').length : 0,
+      copy: text.includes('复制'),
+      revoke: text.includes('撤销'),
+      limit: text.includes('最多 10 把'),
+    };
+  });
+  ok('api-key-generated-and-listed', /^mk_live_[0-9a-f]{32}$/.test(keyPanel.plain) && keyPanel.once
+    && keyPanel.rows === 1 && keyPanel.copy && keyPanel.revoke && keyPanel.limit,
+    `rows=${keyPanel.rows} · 明文 ${keyPanel.plain.slice(0, 12)}…`);
+  await page.getByRole('tab', { name: '接口与示例' }).click();
+  await page.waitForTimeout(500);
+  const docs = await page.evaluate(() => {
+    const text = document.querySelector('[role="dialog"][aria-label="API 与密钥"]')?.innerText ?? '';
+    const key = (text.match(/mk_live_[0-9a-f]{32}/) ?? [''])[0];
+    return {
+      endpoints: ['/api/v1/markets', '/api/v1/account', '/api/v1/order', '/api/v1/positions', '/api/v1/cancel', '/api/v1/sync']
+        .filter((path) => text.includes(path)).length,
+      fields: text.includes('immediate') && text.includes('leverage') && text.includes('symbol'),
+      curlWithKey: text.includes('x-api-key: mk_live_') && key.length === 40,
+      origin: text.includes(location.origin),
+      preCount: document.querySelectorAll('[role="dialog"] pre').length,
+    };
+  });
+  ok('api-docs-list-endpoints-with-real-key', docs.endpoints >= 6 && docs.fields && docs.curlWithKey
+    && docs.origin && docs.preCount >= 4, `端点 ${docs.endpoints} 条 · pre ${docs.preCount} 段 · 带密钥 ${docs.curlWithKey}`);
+  await page.getByRole('tab', { name: '错误码' }).click();
+  await page.waitForTimeout(400);
+  const errText = await page.evaluate(() => document.querySelector('[role="dialog"][aria-label="API 与密钥"]')?.innerText ?? '');
+  ok('api-error-table-covers-key-cases', errText.includes('key_invalid') && errText.includes('insufficient_cash')
+    && errText.includes('match_paused') && errText.includes('too_many_requests'),
+    `命中 ${[errText.includes('key_invalid'), errText.includes('insufficient_cash'), errText.includes('match_paused')].filter(Boolean).length}/3`);
+  await page.keyboard.press('Escape');
+  await page.waitForFunction(() => !document.body.innerText.includes('API 接口与密钥'), null, { timeout: 5_000 });
+  ok('api-drawer-closes-on-escape', true);
+
+  // 9) mobile shell: smaller page size, everything on screen
   await page.setViewportSize({ width: 390, height: 844 });
   await page.waitForTimeout(600);
   const m = await page.evaluate(() => {

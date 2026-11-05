@@ -12,7 +12,8 @@ import { Store } from './store.mjs';
 import { MAX_QTY, REASONS, REASONS_US, judgeOrder, planLiquidation, reasonText, validateOrder } from './engine.mjs';
 import { SIDE_LABELS, SIDES, applyTrade, marketOfTrade, metricsOf, replay, startCashOf, tradesOf } from './ledger.mjs';
 import {
-  checkPassword, digestToken, hashPassword, newId, newToken, normalizeDisplay, normalizeUsername, verifyPassword,
+  checkPassword, digestToken, hashPassword, looksLikeApiKey, newApiKey, newId, newToken, apiKeyHint,
+  normalizeDisplay, normalizeUsername, verifyPassword,
 } from './auth.mjs';
 import { ensureAdmins, readSettingsCached, runAdmin } from './admin.mjs';
 
@@ -20,12 +21,98 @@ const SESSION_DAYS = 30;
 const json = (body, status = 200) => Response.json(body, {
   status, headers: { 'cache-control': 'no-store', 'content-type': 'application/json' },
 });
-const bad = (code, status = 400) => json({ ok: false, code }, status);
+
+// 对外接口要自带可读的错误说明（调用方没有前端那份文案表），所以错误响应统一带 message。
+// 拒单原因来自引擎规则表（按市场换文案），传输层与权限层的错误码在这里补齐。
+const API_MESSAGES = {
+  body_invalid: '请求体不是合法 JSON 或超出大小限制。',
+  method_not_allowed: '该接口只接受 POST。',
+  not_found: '接口不存在。',
+  login_required: '缺少或无效的凭证：请求头 x-api-key（或 Authorization: Bearer）需要本人生成的 API 密钥，未提供时回退到会话令牌。',
+  credential_invalid: '用户名或口令不正确。',
+  account_locked: '连续失败过多，该账户已临时锁定 15 分钟。',
+  username_taken: '该用户名已被占用。',
+  username_invalid: '用户名需为 2-24 位中文、字母、数字或 _ . -。',
+  password_invalid: '口令至少 8 位，且需同时包含字母与数字。',
+  too_many_requests: '请求过于频繁，请降低调用频率后重试。',
+  quote_unavailable: '行情源暂不可用，无法校验委托价格与可用保证金。',
+  chart_unavailable: '该标的的分时/K 线暂时取不到。',
+  symbol_invalid: '标的代码格式不正确，或无法在沪深/美股中定位该代码。',
+  unknown_symbol: '找不到该标的的实时行情。',
+  order_invalid: '委托编号不正确。',
+  cancel_failed: '该委托已成交或已撤销，无法再次撤单。',
+  read_failed: '账户数据读取失败。',
+  write_failed: '写入失败，委托未落库。',
+  duplicate: '该操作已处理过，无需重复提交。',
+  server_error: '服务内部错误。',
+  key_invalid: 'API 密钥无效或已撤销。',
+  key_management_requires_session: '密钥的生成与撤销只能用网页登录后的会话令牌，不能用 API 密钥本身。',
+  key_limit: '每个账户最多保留 10 把有效密钥。',
+  name_invalid: '密钥备注名过长或含非法字符。',
+};
+
+const bad = (code, status = 400) => json({
+  ok: false, code, message: API_MESSAGES[code] ?? REASONS[code] ?? '请求未成功，请检查参数与当前状态。',
+}, status);
 
 const READ_ACTIONS = new Set(['board', 'sync', 'me', 'chart', 'leader', 'rules', 'lookup', 'search',
+  'account', 'positions', 'orders', 'trades', 'markets', 'key_list',
   'admin_overview', 'admin_users', 'admin_user', 'admin_orders', 'admin_audit', 'admin_settings']);
 const WRITE_ACTIONS = new Set(['register', 'login', 'logout', 'order', 'cancel', 'preview', 'watch_add', 'watch_remove', 'watch_sort',
+  'key_create', 'key_revoke',
   'admin_freeze', 'admin_unfreeze', 'admin_unlock', 'admin_revoke_sessions', 'admin_role', 'admin_grant_cash']);
+
+// 公开 REST 层：路径 + 方法 → 内部 action。只在这一层做「对外友好名」到内部字段的翻译，
+// 撮合、风控、账本仍然只有一份实现，不存在两套口径。
+const REST_ROUTES = [
+  ['GET', '/api/v1/markets', () => ({ action: 'markets' })],
+  ['GET', '/api/v1/quote', (q) => ({ action: 'lookup', payload: { symbol: q.symbol ?? q.code ?? q.secid ?? '' } })],
+  ['GET', '/api/v1/quotes', (q) => ({ action: 'board', payload: { limit: q.limit } })],
+  ['GET', '/api/v1/search', (q) => ({ action: 'search', payload: { q: q.q ?? q.query ?? '' } })],
+  ['GET', '/api/v1/chart', (q) => ({
+    action: 'chart',
+    payload: { symbol: q.symbol ?? q.code ?? q.secid ?? '', kind: q.kind, count: q.count },
+  })],
+  ['GET', '/api/v1/account', () => ({ action: 'account' })],
+  ['GET', '/api/v1/positions', () => ({ action: 'positions' })],
+  ['GET', '/api/v1/orders', (q) => ({ action: 'orders', payload: { status: q.status, limit: q.limit, offset: q.offset } })],
+  ['GET', '/api/v1/trades', (q) => ({ action: 'trades', payload: { limit: q.limit, offset: q.offset } })],
+  ['GET', '/api/v1/leaderboard', () => ({ action: 'leader' })],
+  ['GET', '/api/v1/rules', () => ({ action: 'rules' })],
+  ['GET', '/api/v1/keys', () => ({ action: 'key_list' })],
+  ['POST', '/api/v1/order', (q, body) => ({ action: 'order', payload: apiOrder(body) })],
+  ['POST', '/api/v1/order/preview', (q, body) => ({ action: 'preview', payload: apiOrder(body) })],
+  ['POST', '/api/v1/cancel', (q, body) => ({ action: 'cancel', payload: { orderId: body.orderId ?? body.id } })],
+  ['POST', '/api/v1/sync', () => ({ action: 'sync' })],
+  ['POST', '/api/v1/keys', (q, body) => ({ action: 'key_create', payload: { name: body.name } })],
+  ['POST', '/api/v1/keys/revoke', (q, body) => ({ action: 'key_revoke', payload: { id: body.id ?? body.keyId } })],
+];
+
+// 对外字段名按行业习惯：symbol / type / price / leverage / immediate。
+// 内部字段（secid / mode / limitPrice / leaf）同样接受，方便网页端代码直接复用。
+function apiOrder(body = {}) {
+  const type = String(body.type ?? body.mode ?? 'market').toLowerCase();
+  return {
+    side: body.side,
+    symbol: body.symbol ?? body.secid,
+    qty: body.qty,
+    mode: type === 'limit' || type === 'limit_order' ? 'limit' : 'market',
+    limitPrice: body.price ?? body.limitPrice ?? null,
+    leaf: body.leverage ?? body.leaf ?? 1,
+    immediate: body.immediate !== false,
+    confirmDuplicate: body.confirmDuplicate === true,
+  };
+}
+
+function restRoute(method, pathname, params, body) {
+  for (const [verb, path, build] of REST_ROUTES) {
+    if (path !== pathname) continue;
+    const query = Object.fromEntries(params.entries());
+    const hit = build(query, body ?? {});
+    return { ...hit, method: verb };
+  }
+  return null;
+}
 
 const UNAUTHED = () => Object.assign(new Error('login_required'), { code: 'login_required', status: 401 });
 
@@ -52,6 +139,29 @@ function quoteDayFor(quotes, market) {
 // 设置表读不到时按「未熔断」处理：行情与查询不该因为设置表出问题而停摆，撮合还有时段窗口兜底
 const pausedFor = (settings, market) => Boolean(settings?.[market === 'us' ? 'match_paused_us' : 'match_paused']);
 
+// 对外允许三种写法：完整 secid（105.AAPL / 1.600519）、A 股 6 位代码、美股字母代码。
+const CN_CODE = /^\d{6}$/;
+const US_CODE = /^[A-Za-z][A-Za-z0-9._-]{0,9}$/;
+async function resolveSecid(input, now = new Date()) {
+  const text = clampText(input, 20);
+  if (!text) return null;
+  if (validSecid(text)) {
+    // secid 的市场号与点保留原样，代码部分统一大写：美股上游接口只认大写代码
+    const dot = text.indexOf('.');
+    const head = text.slice(0, dot);
+    const code = text.slice(dot + 1);
+    return /^\d+$/.test(code) ? `${head}.${code}` : `${head}.${code.toUpperCase()}`;
+  }
+  if (CN_CODE.test(text)) return /^[569]/.test(text) ? `1.${text}` : `0.${text}`;
+  if (US_CODE.test(text)) {
+    const upper = text.toUpperCase();
+    // 同一份代码可能挂在不同交易所，交给检索接口定位，不猜
+    const rows = await searchSymbols(upper, new Map(), now, 'us').catch(() => []);
+    return rows.find((row) => String(row.code).toUpperCase() === upper)?.secid ?? null;
+  }
+  return null;
+}
+
 // 某个市场的一轮账本快照：行情 → 该市场流水重放 → 补取持仓行情
 async function poolView(store, user, market, now) {
   const nowMs = now.getTime();
@@ -72,6 +182,20 @@ function tokenOf(body, params, request) {
   if (header.length >= 32 && header.length <= 128) return header;
   return '';
 }
+
+// ---- API 密钥：三种携带方式，都不走 query（会进访问日志） ----
+// x-api-key 在自建与云网关两条链路上都能透传，Authorization: Bearer 是公开接口的习惯写法。
+function apiKeyOf(body, request) {
+  const header = request.headers.get('x-api-key') ?? '';
+  if (looksLikeApiKey(header)) return header.trim();
+  const bearer = (request.headers.get('authorization') ?? '').replace(/^Bearer\s+/i, '').trim();
+  if (looksLikeApiKey(bearer)) return bearer;
+  const fromBody = typeof body?.apiKey === 'string' ? body.apiKey.trim() : '';
+  return looksLikeApiKey(fromBody) ? fromBody : '';
+}
+
+const KEY_LIMIT_ACTIVE = 10;
+const API_CALLS_PER_MINUTE = 240;
 
 // 同一-标的-方向-数量-价格-杠杆 的委托，短时间内重复提交要显式确认，防止误触连点
 const DUPLICATE_WINDOW_MS = 15_000;
@@ -162,10 +286,20 @@ const RULES = (settings = null, market = 'cn') => ({
 export async function handle({ request, supabase }) {
   const store = new Store(supabase);
   const url = new URL(request.url);
-  const action = url.searchParams.get('action') ?? 'board';
   const method = request.method.toUpperCase();
-  const body = method === 'GET' ? {} : await readBody(request);
-  if (body === null) return bad('body_invalid');
+  const raw = method === 'GET' || method === 'HEAD' ? {} : await readBody(request);
+  if (raw === null) return bad('body_invalid');
+  // /api/v1/* 是对外 REST 入口：把友好字段翻成内部 action + payload，其余逻辑与网页端共用一份
+  const rest = url.pathname.startsWith('/api/');
+  let action = url.searchParams.get('action') ?? 'board';
+  let body = raw;
+  if (rest) {
+    const route = restRoute(method, url.pathname, url.searchParams, raw);
+    if (!route) return bad('not_found', 404);
+    action = route.action;
+    body = { ...raw, ...route.payload };
+    if (body.market === undefined) body.market = url.searchParams.get('market') ?? undefined;
+  }
   if (method === 'GET' && WRITE_ACTIONS.has(action)) return bad('method_not_allowed', 405);
   if (!READ_ACTIONS.has(action) && !WRITE_ACTIONS.has(action)) return bad('not_found', 404);
 
@@ -191,11 +325,17 @@ export async function handle({ request, supabase }) {
       });
       return json({ ok: true, action, ...result });
     }
-    const ctx = { store, request, body, url, now, nowMs, clock, market, settings };
+    const ctx = {
+      store, request, body, url, now, nowMs, clock, market, settings, rest,
+      token: tokenOf(body, url.searchParams, request),
+      apiKey: apiKeyOf(body, request),
+      // REST 侧默认「下单即撮合」，网页端保持原来的 3 秒一轮节奏
+      immediate: body.immediate === undefined ? rest : body.immediate === true,
+    };
     switch (action) {
       case 'rules': return json({ ok: true, rules: RULES(ctx.settings, market) });
       case 'board': return await boardAction(ctx);
-      case 'chart': return await chartAction(body);
+      case 'chart': return await chartAction(body, now);
       case 'lookup': return await lookupAction(body, now);
       case 'search': return await searchAction(body, now, market);
       // 排行榜按日结快照排名，而快照恒以「北京日」为键（两市合并折人民币），所以取日不跟随当前市场
@@ -211,6 +351,14 @@ export async function handle({ request, supabase }) {
       case 'watch_add': return await watchAction('add', ctx);
       case 'watch_remove': return await watchAction('remove', ctx);
       case 'watch_sort': return await watchSortAction(ctx);
+      case 'markets': return await marketsAction(ctx);
+      case 'account': return await accountAction(ctx);
+      case 'positions': return await positionsAction(ctx);
+      case 'orders': return await ordersAction(ctx);
+      case 'trades': return await tradesAction(ctx);
+      case 'key_list': return await keyListAction(ctx);
+      case 'key_create': return await keyCreateAction(ctx);
+      case 'key_revoke': return await keyRevokeAction(ctx);
       default: return bad('not_found', 404);
     }
   } catch (error) {
@@ -224,8 +372,9 @@ export async function handle({ request, supabase }) {
 }
 
 async function lookupAction(body, now) {
-  const secid = clampText(body.secid, 16);
-  if (!validSecid(secid)) return bad('symbol_invalid');
+  // 三种写法都接受：secid（105.AAPL / 1.600519）、A 股 6 位代码、美股字母代码
+  const secid = await resolveSecid(body.secid ?? body.symbol ?? body.code, now);
+  if (!secid) return bad('symbol_invalid');
   const target = marketOfSecid(secid);
   const quotes = await quotesFor(target, false, now).catch(() => new Map());
   const quote = quotes.get(secid) ?? await ensureQuote(secid, quotes, now);
@@ -240,14 +389,14 @@ async function searchAction(body, now, market) {
   return json({ ok: true, rows, market, currency: CURRENCY_LABEL[market] });
 }
 
-async function chartAction(body) {
-  const secid = clampText(body.secid, 16);
+async function chartAction(body, now = new Date()) {
+  const secid = await resolveSecid(body.secid ?? body.symbol ?? body.code, now);
   const kind = body.kind === 'kline' ? 'kline' : 'trends';
-  if (!validSecid(secid)) return bad('symbol_invalid');
+  if (!secid) return bad('symbol_invalid');
   const count = Math.min(320, Math.max(30, Number(body.count) || 120));
   const series = kind === 'kline' ? await klineOf(secid, count) : await trendsOf(secid);
   if (!series) return bad('chart_unavailable', 503);
-  return json({ ok: true, secid, kind, market: marketOfSecid(secid), series });
+  return json({ ok: true, secid, symbol: secid.split('.')[1], kind, market: marketOfSecid(secid), series });
 }
 
 // 折人民币口径的日结快照 → 排行榜本金也要同口径：开户时冻结的两笔本金都按当前汇率合并
@@ -353,6 +502,35 @@ async function requireUser(store, token, nowMs) {
   return user;
 }
 
+// API 密钥鉴权：只按摘要点查，明文永不入库也就无从比对。
+// 使用计数是附带写，失败不能挡住查询本身。
+async function requireUserByKey(store, key, nowMs) {
+  const row = await store.getApiKey(await digestToken(key));
+  // 「密钥不对」与「没带凭证」要分开：调用方看到 key_invalid 就知道该去换密钥，而不是重新登录
+  if (!row || row.revoked_at) throw denied('key_invalid', 401);
+  const user = await store.getUserById(row.user_id);
+  if (!user) throw denied('key_invalid', 401);
+  if (throttled(`apikey:${row.id}`, API_CALLS_PER_MINUTE, 60_000, nowMs)) {
+    throw denied('too_many_requests', 429);
+  }
+  await store.touchApiKey(row.id, new Date(nowMs).toISOString(), (Number(row.calls) || 0) + 1).catch(() => false);
+  return user;
+}
+
+// 每个业务动作只认这一个身份入口：有 API 密钥就走密钥，否则回退到会话令牌。
+async function requirePrincipal(ctx) {
+  if (ctx.apiKey) return await requireUserByKey(ctx.store, ctx.apiKey, ctx.nowMs);
+  return await requireUser(ctx.store, ctx.token, ctx.nowMs);
+}
+
+const denied = (code, status = 403) => Object.assign(new Error(code), { code, status });
+
+// 密钥管理不允许用密钥自己做：否则一把泄露的密钥可以无限签发新密钥，等于永久接管账户
+async function requireSessionPrincipal(ctx) {
+  if (ctx.apiKey) throw denied('key_management_requires_session');
+  return await requireUser(ctx.store, ctx.token, ctx.nowMs);
+}
+
 // 后台权限只认这里：ADMIN_USERNAMES 未配置时整个后台关闭，公网裸奔也不会凭空多出管理口
 const FORBIDDEN = () => Object.assign(new Error('not_admin'), { code: 'not_admin', status: 403 });
 
@@ -431,8 +609,9 @@ const combinedNet = (pools, fx) => ({
   startCash: pools.cn.metrics.startCash + toCny(pools.us.metrics.startCash, fx),
 });
 
-async function meAction({ store, request, body, url, now, nowMs, clock, market, settings }) {
-  const user = await requireUser(store, tokenOf(body, url.searchParams, request), nowMs);
+async function meAction(ctx) {
+  const { store, body, url, now, nowMs, clock, market, settings } = ctx;
+  const user = await requirePrincipal(ctx);
   const pools = await poolsFor(store, user, now, settings);
   const fx = await getFx(now);
   const active = pools[market];
@@ -464,6 +643,121 @@ function accountView(metrics, today, market = 'cn') {
   };
 }
 
+// ---- 对外接口专用动作：只读、无副作用，且不附带行情池与自选这类大块展示数据 ----
+
+// 两市时段与熔断状态：程序先问「现在哪边在交易」，再决定要不要下单
+async function marketsAction({ now, nowMs, clock, settings }) {
+  return json({
+    ok: true, clock, beijing: clock.stamp, et: etParts(now).stamp,
+    fx: await getFx(now).catch(() => 0),
+    markets: marketsStatus(now, settings),
+    at: new Date(nowMs).toISOString(),
+  });
+}
+
+// 账户全景：两个池子各一份完整账，外加按当日汇率合并的人民币口径
+async function accountAction(ctx) {
+  const user = await requirePrincipal(ctx);
+  const pools = await poolsFor(ctx.store, user, ctx.now, ctx.settings);
+  const fx = await getFx(ctx.now);
+  return json({
+    ok: true, day: ctx.clock.day, market: ctx.market, currency: CURRENCY_LABEL[ctx.market], fx,
+    accounts: {
+      cn: accountView(pools.cn.metrics, pools.cn.day, 'cn'),
+      us: accountView(pools.us.metrics, pools.us.day, 'us'),
+    },
+    combined: combinedNet(pools, fx),
+    session: pools[ctx.market].session, matchable: pools[ctx.market].matchable,
+    matchPaused: pools[ctx.market].paused, stale: pools[ctx.market].stale,
+    markets: marketsStatus(ctx.now, ctx.settings),
+  });
+}
+
+// 持仓：默认两个市场一起返回（程序更关心「我全部持仓」），`?market=cn|us` 只看一边
+async function positionsAction(ctx) {
+  const user = await requirePrincipal(ctx);
+  const pools = await poolsFor(ctx.store, user, ctx.now, ctx.settings);
+  const wanted = ctx.body.market === 'cn' || ctx.body.market === 'us' ? [ctx.body.market] : MARKETS;
+  return json({
+    ok: true,
+    positions: wanted.flatMap((item) => (pools[item].metrics.positions ?? []).map((position) => ({
+      ...position, market: item, currency: CURRENCY_LABEL[item], day: pools[item].day,
+    }))),
+    debts: wanted.flatMap((item) => (pools[item].metrics.debtBySymbol ?? []).map((debt) => ({
+      ...debt, market: item, currency: CURRENCY_LABEL[item],
+    }))),
+  });
+}
+
+async function ordersAction(ctx) {
+  const user = await requirePrincipal(ctx);
+  const status = ['open', 'filling', 'filled', 'canceled', 'rejected'].includes(ctx.body.status) ? String(ctx.body.status) : null;
+  const limit = Math.min(200, Math.max(1, Number(ctx.body.limit) || 50));
+  const offset = Math.max(0, Number(ctx.body.offset) || 0);
+  const rows = status
+    ? await ctx.store.listOrdersAdmin({ userId: user.id, status, limit, offset })
+    : (await ctx.store.listOpenOrders(user.id)).slice(offset, offset + limit);
+  const filtered = rows.filter((order) => ctx.body.market === undefined || ctx.body.market === 'all'
+    || normalizeMarket(ctx.body.market) === marketOf(order.secid));
+  return json({ ok: true, orders: filtered.map(orderView), limit, offset, status: status ?? 'open' });
+}
+
+async function tradesAction(ctx) {
+  const user = await requirePrincipal(ctx);
+  const limit = Math.min(500, Math.max(1, Number(ctx.body.limit) || 50));
+  const offset = Math.max(0, Number(ctx.body.offset) || 0);
+  const rows = await ctx.store.listRecentTrades(user.id, Math.min(5000, limit + offset + 50));
+  const mine = rows.filter((trade) => ctx.body.market === undefined || ctx.body.market === 'all'
+    || normalizeMarket(ctx.body.market) === marketOfTrade(trade));
+  return json({ ok: true, trades: mine.slice(offset, offset + limit).map(tradeView), limit, offset });
+}
+
+// ---- API 密钥管理：只认网页会话，明文只在生成响应里出现一次 ----
+const KEY_NAME_MAX = 24;
+
+async function keyListAction(ctx) {
+  const user = await requireSessionPrincipal(ctx);
+  const rows = await ctx.store.listApiKeys(user.id);
+  return json({
+    ok: true,
+    keys: rows.map((row) => ({
+      id: row.id, name: row.name ?? '', hint: row.hint, created_at: row.created_at,
+      last_used_at: row.last_used_at ?? null, calls: Number(row.calls) || 0,
+      revoked: Boolean(row.revoked_at), revoked_at: row.revoked_at ?? null,
+    })),
+    limit: KEY_LIMIT_ACTIVE,
+  });
+}
+
+async function keyCreateAction(ctx) {
+  const user = await requireSessionPrincipal(ctx);
+  const name = clampText(ctx.body.name, KEY_NAME_MAX);
+  const rows = await ctx.store.listApiKeys(user.id);
+  if (rows.filter((row) => !row.revoked_at).length >= KEY_LIMIT_ACTIVE) return bad('key_limit', 409);
+  const key = newApiKey();
+  const row = await ctx.store.insertApiKey({
+    id: newId(), user_id: user.id, name: name || '未命名密钥',
+    digest: await digestToken(key), hint: apiKeyHint(key),
+    created_at: new Date(ctx.nowMs).toISOString(), last_used_at: null, revoked_at: null, calls: 0,
+  });
+  if (!row) return bad('write_failed', 503);
+  return json({
+    ok: true, apiKey: key, hint: row.hint ?? apiKeyHint(key), name: row.name, created_at: row.created_at,
+    // 明文不落库，服务端也无法再取回，所以必须把「只给一次」这件事讲明白
+    notice: '这是唯一一次显示完整密钥，请立即保存；丢失只能撤销后重新生成。',
+  });
+}
+
+async function keyRevokeAction(ctx) {
+  const user = await requireSessionPrincipal(ctx);
+  const id = clampText(ctx.body.id, 40);
+  if (!/^[0-9a-f-]{36}$/i.test(id)) return bad('order_invalid');
+  const done = await ctx.store.revokeApiKey(id, user.id, new Date(ctx.nowMs).toISOString());
+  if (!done) return bad('cancel_failed', 409);
+  const rows = await ctx.store.listApiKeys(user.id);
+  return json({ ok: true, revoked: id, keys: rows.map((row) => ({ id: row.id, name: row.name ?? '', hint: row.hint, revoked: Boolean(row.revoked_at) })) });
+}
+
 async function fillHeldQuotes(state, quotes, now) {
   let extra = 0;
   for (const symbol of state.books.keys()) {
@@ -474,9 +768,18 @@ async function fillHeldQuotes(state, quotes, now) {
   }
 }
 
+// 一个市场的一轮撮合：挂单判定 → 风控 → 刷新指标。同步循环与「下单即撮合」共用这一段
+async function runPoolRound(store, pool, user, orders, now, nowMs) {
+  const round = await matchMarketOrders(store, pool, user, orders, now, nowMs);
+  await riskRound(store, pool, user, round.matched, nowMs);
+  pool.metrics = metricsOf(pool.state, pool.quotes, nowMs);
+  return round;
+}
+
 // 同步 = 两个市场各撮合一轮：过期撤单 → 挂单判定 → 强制平仓 → 合并日结快照
-async function syncAction({ store, request, body, url, now, nowMs, clock, market, settings }) {
-  const user = await requireUser(store, tokenOf(body, url.searchParams, request), nowMs);
+async function syncAction(ctx) {
+  const { store, url, now, nowMs, clock, market, settings } = ctx;
+  const user = await requirePrincipal(ctx);
   const pools = await poolsFor(store, user, now, settings);
   const fx = await getFx(now);
   const orders = await store.listOpenOrders(user.id);
@@ -484,12 +787,9 @@ async function syncAction({ store, request, body, url, now, nowMs, clock, market
   const filled = [];
   let canceled = 0;
   for (const item of MARKETS) {
-    const pool = pools[item];
-    const round = await matchMarketOrders(store, pool, user, orders, now, nowMs);
+    const round = await runPoolRound(store, pools[item], user, orders, now, nowMs);
     filled.push(...round.filled);
     canceled += round.canceled;
-    await riskRound(store, pool, user, round.matched, nowMs);
-    pool.metrics = metricsOf(pool.state, pool.quotes, nowMs);
   }
 
   const active = pools[market];
@@ -673,12 +973,14 @@ function draftFingerprint(body) {
     Math.trunc(Number(body.leaf ?? 1))].join(':');
 }
 
-async function orderAction(previewOnly, { store, request, body, url, nowMs, settings }) {
-  const user = await requireUser(store, tokenOf(body, url.searchParams, request), nowMs);
+async function orderAction(previewOnly, ctx) {
+  const { store, body, nowMs, settings } = ctx;
+  const user = await requirePrincipal(ctx);
   // 冻结只挡新的风险敞口；撤单与查询仍然放行，避免把人困在已有持仓里
   if (user.status === 'frozen') return bad('account_frozen', 403);
-  const secid = clampText(body.secid, 16);
-  if (!validSecid(secid)) return bad('symbol_invalid');
+  // 下单同样接受 symbol 写法（AAPL / 600519 / 105.AAPL），与查询接口保持一致
+  const secid = await resolveSecid(body.secid ?? body.symbol ?? body.code, new Date(nowMs));
+  if (!secid) return bad('symbol_invalid');
   // 委托归属哪个市场由标的本身决定：前端切了市场也不会把美股单挂进人民币池
   const market = marketOfSecid(secid);
   if (!previewOnly && pausedFor(settings, market)) return bad('match_paused', 409);
@@ -686,9 +988,10 @@ async function orderAction(previewOnly, { store, request, body, url, nowMs, sett
     if (throttled(`order:${user.id}`, 30, 60_000, nowMs)) return bad('too_many_requests', 429);
     const key = `${user.id}|${String(body.side ?? '')}|${secid}|${draftFingerprint(body)}`;
     const last = recentSubmits.get(key);
-    if (last && nowMs - last < DUPLICATE_WINDOW_MS && body.confirmDuplicate !== true) return bad('duplicate_order', 409);
+    // 用绝对时间差：单调时钟下与原来等价，但测试把时钟拨回上一轮时不会把「14 小时前的同一笔」误判成刚提交过
+    if (last && Math.abs(nowMs - last) < DUPLICATE_WINDOW_MS && body.confirmDuplicate !== true) return bad('duplicate_order', 409);
     if (recentSubmits.size > 3000) {
-      for (const [oldKey, at] of recentSubmits) if (nowMs - at > DUPLICATE_WINDOW_MS) recentSubmits.delete(oldKey);
+      for (const [oldKey, at] of recentSubmits) if (Math.abs(nowMs - at) > DUPLICATE_WINDOW_MS) recentSubmits.delete(oldKey);
     }
     recentSubmits.set(key, nowMs);
   }
@@ -749,15 +1052,37 @@ async function orderAction(previewOnly, { store, request, body, url, nowMs, sett
     created_at: new Date(nowMs).toISOString(), updated_at: new Date(nowMs).toISOString(),
   });
   if (!order) return bad('write_failed', 503);
-  const metrics = metricsOf(state, quotes, nowMs);
+  let metrics = metricsOf(state, quotes, nowMs);
+  let status = order.status;
+  let fill = null;
+  // 对外接口默认「下单即撮合」：马上为该市场跑一轮，响应里直接给成交结果。
+  // 撮合本身走的还是同一套 CAS 抢占 + order_id 唯一约束，所以与网页端 3 秒一轮不会有双重成交。
+  if (ctx.immediate && !previewOnly) {
+    const pool = await poolView(store, user, market, now);
+    pool.paused = pausedFor(settings, market);
+    pool.matchable = matchableMarket(market, now, pool.paused);
+    await runPoolRound(store, pool, user, await store.listOpenOrders(user.id), now, nowMs);
+    metrics = pool.metrics;
+    const settled = await store.getOrder(order.id).catch(() => null);
+    if (settled) status = settled.status;
+    if (status === 'filled') {
+      fill = {
+        price: settled.fill_price ?? result.trade.price, qty: settled.fill_qty ?? draft.qty,
+        fee: settled.fill_fee ?? result.trade.fee,
+        amount: (settled.fill_price ?? result.trade.price) * (settled.fill_qty ?? draft.qty),
+      };
+    }
+  }
   return json({
-    ok: true, market, currency: CURRENCY_LABEL[market], order: orderView(order), preview: result.preview,
+    ok: true, market, currency: CURRENCY_LABEL[market], order: orderView({ ...order, status }),
+    status, fill, preview: result.preview,
     account: accountView(metrics, day, market), queued: validDay > day,
   });
 }
 
-async function watchSortAction({ store, request, body, url, nowMs }) {
-  const user = await requireUser(store, tokenOf(body, url.searchParams, request), nowMs);
+async function watchSortAction(ctx) {
+  const { store, body, nowMs } = ctx;
+  const user = await requirePrincipal(ctx);
   const list = Array.isArray(body.secids) ? body.secids.slice(0, 80) : [];
   if (!list.length) return bad('symbol_invalid');
   const rows = await store.listWatch(user.id);
@@ -768,10 +1093,11 @@ async function watchSortAction({ store, request, body, url, nowMs }) {
   return json({ ok: true, watch: await store.listWatch(user.id) });
 }
 
-async function watchAction(mode, { store, request, body, url, nowMs, now }) {
-  const user = await requireUser(store, tokenOf(body, url.searchParams, request), nowMs);
-  const secid = clampText(body.secid, 16);
-  if (!validSecid(secid)) return bad('symbol_invalid');
+async function watchAction(mode, ctx) {
+  const { store, body, nowMs, now } = ctx;
+  const user = await requirePrincipal(ctx);
+  const secid = await resolveSecid(body.secid ?? body.symbol ?? body.code, now);
+  if (!secid) return bad('symbol_invalid');
   const market = marketOfSecid(secid);
   if (mode === 'add') {
     const quotes = await quotesFor(market, false, now).catch(() => new Map());
@@ -791,8 +1117,9 @@ async function watchAction(mode, { store, request, body, url, nowMs, now }) {
   return json({ ok: true, watch: rows, market, currency: CURRENCY_LABEL[market], action: mode });
 }
 
-async function cancelAction({ store, request, body, url, nowMs, market }) {
-  const user = await requireUser(store, tokenOf(body, url.searchParams, request), nowMs);
+async function cancelAction(ctx) {
+  const { store, body, nowMs, market } = ctx;
+  const user = await requirePrincipal(ctx);
   const id = clampText(body.orderId, 40);
   if (!/^[0-9a-f-]{36}$/i.test(id)) return bad('order_invalid');
   const done = await store.patchOrder(id, { status: 'canceled', reason: '已手动撤单', updated_at: new Date(nowMs).toISOString() }, 'open');

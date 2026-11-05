@@ -152,7 +152,8 @@ const server = createServer(async (req, res) => {
     return send(res, 200, JSON.stringify({ ok: true, driver: db.driver, webDir: WEB_DIR }),
       { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
   }
-  if (url.pathname.startsWith('/functions/')) return serveApi(req, res, url);
+  // /functions/v1/app 是网页端与云函数入口，/api/v1/* 是对外 REST 入口，两者共用同一个 handle()
+  if (url.pathname.startsWith('/functions/') || url.pathname.startsWith('/api/')) return serveApi(req, res, url);
   if (req.method !== 'GET' && req.method !== 'HEAD') return notFound(res);
   return serveStatic(res, url.pathname);
 });

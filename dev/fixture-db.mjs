@@ -15,10 +15,11 @@ const UNIQUE = {
   watchlists: [['user_id', 'secid']],
   settings: [['key']],
   audit: [],
+  api_keys: [['digest']],
 };
 const PRIMARY = {
   users: 'id', sessions: 'token', orders: 'id', trades: 'id', events: 'id', snapshots: 'id',
-  watchlists: 'id', settings: 'key', audit: 'id',
+  watchlists: 'id', settings: 'key', audit: 'id', api_keys: 'id',
 };
 
 const clone = (value) => JSON.parse(JSON.stringify(value));

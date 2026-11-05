@@ -49,6 +49,23 @@ export async function digestToken(token) {
   return hex(buffer);
 }
 
+// ---- 个人 API 密钥 ----
+// 明文只在生成那一次返回，库里只存 SHA-256 摘要；前缀 mk_live_ 便于日志里辨认与脱敏。
+export const API_KEY_PREFIX = 'mk_live_';
+const API_KEY_BODY = 32; // 16 字节随机数的 hex，够长且不会混进 base64 的 +/- 转义问题
+
+export function newApiKey() {
+  return API_KEY_PREFIX + hex(crypto.getRandomValues(new Uint8Array(API_KEY_BODY / 2)));
+}
+
+export const looksLikeApiKey = (text) => new RegExp(`^${API_KEY_PREFIX}[0-9a-f]{${API_KEY_BODY}}$`).test(String(text ?? ''));
+
+// 列表里只显示头尾，足够用户分辨「哪把是我的脚本」，又不至于泄露可用片段
+export const apiKeyHint = (key) => {
+  const text = String(key ?? '');
+  return text.length <= 16 ? text : `${text.slice(0, API_KEY_PREFIX.length + 4)}…${text.slice(-4)}`;
+};
+
 export function newId() {
   return crypto.randomUUID();
 }

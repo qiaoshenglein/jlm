@@ -5,6 +5,7 @@ import { Auth } from './components/Auth';
 import { Book } from './components/Book';
 import { DetailPanel, MarketPanel, Tape, type Tab } from './components/Market';
 import { Admin } from './components/Admin';
+import { ApiDocs } from './components/ApiDocs';
 import { Rules } from './components/Rules';
 import { Ticket } from './components/Ticket';
 import {
@@ -49,6 +50,7 @@ type User = { id: string; username: string; display: string; role?: 'user' | 'ad
   const knownWatch = useRef<Set<string>>(new Set());
   const [banner, setBanner] = useState('');
   const [showRules, setShowRules] = useState(false);
+  const [showApi, setShowApi] = useState(false);
   const [visibleRows, setVisibleRows] = useState<{ secid: string }[]>([]);
   const [lines, setLines] = useState<Lines>(DEFAULT_LINES); // 风控线由后台热改，标签与刻度跟着走
   const [density, setDensity] = useState<'compact' | 'standard' | 'roomy'>(() => {
@@ -221,11 +223,12 @@ type User = { id: string; username: string; display: string; role?: 'user' | 'ad
       const typing = Boolean(target && (/^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName) || target.isContentEditable));
       if (event.key === 'Escape') {
         setShowRules(false);
+        setShowApi(false);
         if (typing) target?.blur();
         else setSearch('');
         return;
       }
-      if (typing || showRules) return;
+      if (typing || showRules || showApi) return;
       if (event.key === '/') {
         event.preventDefault();
         if (mobile) setView('quote');
@@ -249,11 +252,17 @@ type User = { id: string; username: string; display: string; role?: 'user' | 'ad
       if (event.key === 'm' || event.key === 'M') {
         event.preventDefault();
         switchMarket(market === 'us' ? 'cn' : 'us');
+        return;
+      }
+      // A 打开 API 面板：程序化下单的人每天都要找密钥，不该藏在三步之外
+      if (event.key === 'a' || event.key === 'A') {
+        event.preventDefault();
+        setShowApi(true);
       }
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [market, mobile, selected, showRules, switchMarket, visibleRows, user]);
+  }, [market, mobile, selected, showApi, showRules, switchMarket, visibleRows, user]);
 
   async function submitAuth(action: 'login' | 'register', payload: Record<string, string>) {
     const result = await api<{
@@ -477,6 +486,9 @@ type User = { id: string; username: string; display: string; role?: 'user' | 'ad
                 {onAdmin ? '返回交易台' : '后台'}
               </button>
             )}
+            <button type="button" onClick={() => setShowApi(true)}
+              className="chip border-primary/45 text-primary transition hover:bg-primary/12"
+              title="API 接口与密钥（快捷键 A）">API</button>
             <button type="button" onClick={() => setShowRules(true)}
               className="chip border-hairline text-muted-foreground transition hover:border-input hover:text-foreground">规则</button>
             {!mobile && <span className="max-w-[10ch] truncate text-[0.8125rem]">{user.display}</span>}
@@ -538,6 +550,7 @@ type User = { id: string; username: string; display: string; role?: 'user' | 'ad
             <kbd className="ml-2 rounded border border-hairline px-1">B/S</kbd> 方向
             <kbd className="ml-2 rounded border border-hairline px-1">1-5</kbd> 杠杆
             <kbd className="ml-2 rounded border border-hairline px-1">M</kbd> 切市场
+            <kbd className="ml-2 rounded border border-hairline px-1">A</kbd> API
             <kbd className="ml-2 rounded border border-hairline px-1">Enter</kbd> 下单
           </span>
           行情源：东方财富公开接口 · 每 {SYNC_MS / 1000} 秒撮合一轮 · 市价单以最新价全额成交 ·
@@ -547,6 +560,7 @@ type User = { id: string; username: string; display: string; role?: 'user' | 'ad
           {fx > 0 ? ` · 美元折人民币 ${(fx / Y).toFixed(4)}` : ''} · 虚拟资金，不构成投资建议
         </footer>
       )}      {showRules && <Rules extra={reasons} market={market} onClose={() => setShowRules(false)} />}
+      {showApi && <ApiDocs onClose={() => setShowApi(false)} />}
     </div>
   );
 }// 断点用 JS 判定：移动端要换成「底部导航 + 单视图填满视口」的外壳，纯 CSS 切不出这种结构

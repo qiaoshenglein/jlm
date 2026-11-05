@@ -15,9 +15,14 @@ globalThis.Date = class extends RealDate {
 } 
 ;
 const advance = (ms) => { clock += ms; };
+// 两个市场各自钉在自己的行情日子上：北京早上 A 股已经开盘、美股却还在前一天的盘后，
+// 所以这一步可能把时钟往回拨——撮合与账本只看「当前这一轮的 now」，回拨不影响判定，
+// 但 15 秒重复单窗口会受影响，后面的下单都用没被用过的数量。
+const setClock = (ms) => { clock = ms; };
 
 const { handle } = await import('../functions/api.mjs');
-const { getQuotes } = await import('../functions/quotes.mjs');
+const { getQuotes, getUsQuotes } = await import('../functions/quotes.mjs');
+const { etParts } = await import('../functions/rules.mjs');
 try {
   const probe = await getQuotes(true, new RealDate());
   let latest = 0;
@@ -58,6 +63,26 @@ async function call(action, payload = {}, token) {
   const response = await handle({
     request: new Request(`http://x/functions/v1/app?action=${action}`, {
       method: 'POST', body, headers: { 'content-type': 'application/json' },
+    }),
+    supabase,
+  });
+  return { status: response.status, json: await response.json() };
+}
+
+// REST 层同样直接驱动 handle()：Request 的 URL 用 /api/v1/*，鉴权走 x-api-key 头
+async function rest(method, path, { key, body, query, token } = {}) {
+  const url = new URL(`http://x${path}`);
+  for (const [name, value] of Object.entries(query ?? {})) url.searchParams.set(name, String(value));
+  const payload = { ...body };
+  if (token) payload.token = token;
+  const response = await handle({
+    request: new Request(url, {
+      method,
+      body: method === 'GET' || Object.keys(payload).length === 0 ? undefined : JSON.stringify(payload),
+      headers: {
+        'content-type': 'application/json',
+        ...(key ? { 'x-api-key': key } : {}),
+      },
     }),
     supabase,
   });
@@ -448,8 +473,13 @@ check('参数变更写入审计且只记变更项', Boolean(settingsAudit) && St
 const USD = 100_000 * Y;
 const cnCashBefore = (await call('me', { market: 'cn' }, liveToken)).json.account?.cash ?? 0;
 const cnFeesBefore = JSON.stringify((await call('rules')).json.rules?.cn?.fees ?? {});
-const usDay = sync0.json.clock.day;
-advance(Date.parse(`${usDay}T15:30:00Z`) - clock); // 北京 15:30 UTC = 美东 10:30（冬令）/11:30（夏令），必定在常规时段内
+// 美股那一轮用「美股行情自己的日子」拨时钟：北京早上 A 股已开盘、美股却还在前一天的盘后，
+// 若跟着 A 股的当日走，美东日期会比上游新一天，stale 判定会关掉整段撮合
+const usProbe = await getUsQuotes(true, new RealDate()).catch(() => new Map());
+let usQuoteTs = 0;
+for (const quote of usProbe.values()) usQuoteTs = Math.max(usQuoteTs, quote.ts);
+const usDay = etParts(new RealDate(Math.max(usQuoteTs, 0) * 1000)).day;
+setClock(Date.parse(`${usDay}T15:30:00Z`)); // 15:30 UTC = 美东 10:30（冬令）/11:30（夏令），必定在常规时段内
 
 const usBoard = await call('board', { market: 'us' });
 // 取一条价格适中的活跃股：太高（如伯克希尔 A 类）会直接超出美元本金，太低则是仙股
@@ -541,6 +571,86 @@ const cnFeesAfter = JSON.stringify((await call('rules')).json.rules?.cn?.fees ??
 check('改美股费率立即生效且不影响 A 股费率', Math.abs(usFeeRatio - 0.001) < 1e-6 && cnFeesBefore === cnFeesAfter,
   `美股佣金比例 ${usFeeRatio.toFixed(6)} · A 股费率${cnFeesBefore === cnFeesAfter ? '未变' : '被改动'}`);
 await call('admin_settings', { patch: { us_params: { fees: { commission: 0.0002 } } }, confirm: true }, bossToken);
+
+// ==== 对外接口：/api/v1/* 与个人 API 密钥 ====
+const keyCreated = await call('key_create', { name: '自测脚本' }, liveToken);
+const KEY = keyCreated.json.apiKey ?? '';
+check('生成 API 密钥，明文只给这一次', /^mk_live_[0-9a-f]{32}$/.test(String(KEY))
+  && Boolean(keyCreated.json.notice) && String(keyCreated.json.hint ?? '').includes('…'),
+  `${keyCreated.json.hint ?? ''} · ${keyCreated.json.code ?? 'ok'}`);
+
+const noKey = await rest('GET', '/api/v1/account');
+const badKey = await rest('GET', '/api/v1/account', { key: `mk_live_${'0'.repeat(32)}` });
+check('缺凭证与无效密钥分别报错且带说明', noKey.status === 401 && noKey.json.code === 'login_required'
+  && badKey.status === 401 && badKey.json.code === 'key_invalid' && String(badKey.json.message ?? '').length > 6,
+  `${noKey.json.code} / ${badKey.json.code}`);
+
+const quoteUs = await rest('GET', '/api/v1/quote', { query: { symbol: 'AAPL' } });
+const quoteCn = await rest('GET', '/api/v1/quote', { query: { symbol: '510300' } });
+check('symbol 三种写法都能定位标的', quoteUs.json.quote?.secid === '105.AAPL' && quoteUs.json.currency === 'USD'
+  && quoteCn.json.quote?.secid === '1.510300' && quoteCn.json.market === 'cn',
+  `${quoteUs.json.quote?.secid ?? quoteUs.json.code} / ${quoteCn.json.quote?.secid ?? quoteCn.json.code}`);
+
+const apiAcct = await rest('GET', '/api/v1/account', { key: KEY });
+check('GET /account 返回两个池子与合并口径', apiAcct.status === 200 && apiAcct.json.accounts?.cn?.currency === 'CNY'
+  && apiAcct.json.accounts?.us?.currency === 'USD' && (apiAcct.json.fx ?? 0) > 0 && apiAcct.json.combined?.netAssets > 0,
+  `cn ${apiAcct.json.accounts?.cn?.cash} · us ${apiAcct.json.accounts?.us?.cash} · fx ${apiAcct.json.fx}`);
+
+const usOrder = await rest('POST', '/api/v1/order', { key: KEY, body: { symbol: 'ORCL', side: 'buy', qty: 5, type: 'market' } });
+check('REST 下单即撮合，响应直接带成交结果', usOrder.status === 200 && usOrder.json.status === 'filled'
+  && usOrder.json.fill?.qty === 5 && (usOrder.json.fill?.fee ?? 0) >= 1 * Y && usOrder.json.currency === 'USD',
+  `status=${usOrder.json.status ?? usOrder.json.code} · fee=${usOrder.json.fill?.fee ?? 0}`);
+
+const openBefore = await rest('GET', '/api/v1/orders', { key: KEY, query: { status: 'open' } });
+const previewOnly = await rest('POST', '/api/v1/order/preview', { key: KEY, body: { symbol: 'ORCL', side: 'buy', qty: 10, type: 'market' } });
+const openAfter = await rest('GET', '/api/v1/orders', { key: KEY, query: { status: 'open' } });
+check('preview 只试算不落库', previewOnly.json.ok === true && (previewOnly.json.preview?.fee ?? 0) > 0
+  && openAfter.json.orders?.length === openBefore.json.orders?.length,
+  `fee=${previewOnly.json.preview?.fee ?? previewOnly.json.code} · 在途 ${openBefore.json.orders?.length}→${openAfter.json.orders?.length}`);
+
+// 这一段跑在美东时段里，A 股那边已经是「行情非当日数据」，所以用美股标的测「只受理不撮合」
+const deferred = await rest('POST', '/api/v1/order', { key: KEY, body: { symbol: 'KO', side: 'buy', qty: 30, type: 'market', immediate: false } });
+check('immediate=false 只受理，等下一轮', deferred.json.ok === true && deferred.json.status === 'open' && deferred.json.fill === null,
+  `status=${deferred.json.status ?? deferred.json.code}`);
+const cancelBack = await rest('POST', '/api/v1/cancel', { key: KEY, body: { orderId: deferred.json.order?.id } });
+check('REST 撤单可用', cancelBack.json.ok === true, cancelBack.json.code ?? 'ok');
+
+const pushed = await rest('POST', '/api/v1/sync', { key: KEY });
+check('POST /sync 手动推进一轮并回全套账目', pushed.json.ok === true && pushed.json.account?.market === 'cn'
+  && pushed.json.side?.market === 'us' && typeof pushed.json.settled === 'number',
+  `settled=${pushed.json.settled} · canceled=${pushed.json.canceled}`);
+
+const ordersList = await rest('GET', '/api/v1/orders', { key: KEY, query: { status: 'filled' } });
+const tradesList = await rest('GET', '/api/v1/trades', { key: KEY, query: { limit: 5 } });
+check('委托与成交查询按状态筛选且带币种', (ordersList.json.orders ?? []).length > 0
+  && (ordersList.json.orders ?? []).every((row) => row.status === 'filled')
+  && (tradesList.json.trades ?? []).length > 0 && tradesList.json.trades[0].currency !== undefined,
+  `filled ${ordersList.json.orders?.length ?? 0} 笔 · 最新成交 ${tradesList.json.trades?.[0]?.secid}/${tradesList.json.trades?.[0]?.currency}`);
+
+const positionsList = await rest('GET', '/api/v1/positions', { key: KEY });
+const positionMarkets = new Set((positionsList.json.positions ?? []).map((row) => row.market));
+check('持仓默认两个市场一起返回', positionsList.json.ok === true && positionMarkets.has('us'),
+  [...positionMarkets].join('/') || '无持仓');
+
+const viaKey = await rest('GET', '/api/v1/keys', { key: KEY });
+check('密钥不能给自己签发密钥', viaKey.status === 403 && viaKey.json.code === 'key_management_requires_session',
+  `${viaKey.status} ${viaKey.json.code}`);
+
+const listAfter = await call('key_list', {}, liveToken);
+const mine = (listAfter.json.keys ?? []).find((row) => row.hint === keyCreated.json.hint);
+check('密钥记录调用次数与最近使用时间', (mine?.calls ?? 0) >= 5 && Boolean(mine?.last_used_at),
+  `calls=${mine?.calls ?? 0} · last=${mine?.last_used_at ?? '空'}`);
+
+const revoked = await call('key_revoke', { id: mine?.id ?? '' }, liveToken);
+const afterRevoke = await rest('GET', '/api/v1/account', { key: KEY });
+check('撤销立即生效', revoked.json.ok === true && afterRevoke.status === 401 && afterRevoke.json.code === 'key_invalid',
+  `${afterRevoke.status} ${afterRevoke.json.code}`);
+
+const batch = [];
+for (let i = 0; i < 11; i += 1) batch.push(await call('key_create', { name: `批量 ${i}` }, liveToken));
+check('每账户有效密钥上限 10 把', batch.slice(0, 10).every((row) => row.json.ok === true)
+  && batch[10].json.code === 'key_limit' && batch[10].status === 409,
+  `第 11 把 → ${batch[10].json.code}`);
 
 console.log(`\n结果：${failures === 0 ? '全部通过' : `${failures} 项未通过`}`);
 process.exit(failures === 0 ? 0 : 1);

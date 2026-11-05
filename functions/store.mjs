@@ -10,6 +10,7 @@ const TABLES = {
   watchlists: 'watchlists',
   settings: 'settings',
   audit: 'audit',
+  api_keys: 'api_keys',
 };
 
 const USER_COLUMNS = 'id,username,display,pass_hash,created_at,last_login,fail_count,locked_until,role,status,start_cash,start_cash_usd';
@@ -114,8 +115,15 @@ export class Store {
     return fail(result, 'read_failed') ?? [];
   }
 
-  async insertOrder(row) {
-    const result = await this.sb.from(TABLES.orders).insert(row).select(
+  // 单笔委托的当前状态：REST 下单后用它回答「到底成交了没有」
+  async getOrder(id) {
+    const result = await this.sb.from(TABLES.orders)
+      .select('id,user_id,secid,code,name,kind,side,mode,qty,limit_price,leaf,status,day,reason,source,fill_price,fill_qty,fill_fee,created_at,updated_at')
+      .eq('id', id).maybeSingle();
+    return fail(result, 'read_failed') ?? null;
+  }
+
+  async insertOrder(row) {    const result = await this.sb.from(TABLES.orders).insert(row).select(
       'id,secid,code,name,kind,side,mode,qty,limit_price,leaf,status,day,reason,source,created_at,updated_at',
     ).maybeSingle();
     return fail(result, 'write_failed');
@@ -205,6 +213,41 @@ export class Store {
   async removeWatch(userId, secid) {
     const result = await this.sb.from(TABLES.watchlists).delete().eq('user_id', userId).eq('secid', secid).select('id').maybeSingle();
     if (result && result.error) throw new StoreError(result.error.code ?? 'write_failed');
+    return Boolean(result?.data?.id);
+  }
+
+  // ── API 密钥：只存摘要，明文永不落库；撤销是打时间戳而不是删行，便于回看「谁在用什么」 ──
+  async insertApiKey(row) {
+    const result = await this.sb.from(TABLES.api_keys).insert(row)
+      .select('id,user_id,name,hint,created_at').maybeSingle();
+    if (result?.error?.code === '23505') throw new StoreError('duplicate', 409);
+    return fail(result, 'write_failed');
+  }
+
+  async getApiKey(digest) {
+    const result = await this.sb.from(TABLES.api_keys)
+      .select('id,user_id,name,hint,created_at,last_used_at,revoked_at,calls').eq('digest', digest).maybeSingle();
+    return fail(result, 'read_failed') ?? null;
+  }
+
+  async listApiKeys(userId) {
+    const result = await this.sb.from(TABLES.api_keys)
+      .select('id,name,hint,created_at,last_used_at,revoked_at,calls').eq('user_id', userId)
+      .order('created_at', { ascending: false }).limit(50);
+    return fail(result, 'read_failed') ?? [];
+  }
+
+  // 使用计数是读路径上的附带写，失败不能影响接口本身，所以这里不抛错
+  async touchApiKey(id, at, calls) {
+    const result = await this.sb.from(TABLES.api_keys).update({ last_used_at: at, calls }).eq('id', id).select('id').maybeSingle();
+    return Boolean(result?.data?.id);
+  }
+
+  async revokeApiKey(id, userId, at) {
+    // 重复撤销只是把时间戳再盖一次，没有副作用，所以不再额外加 IS NULL 条件（三种数据层写法不同）
+    const result = await this.sb.from(TABLES.api_keys)
+      .update({ revoked_at: at }).eq('id', id).eq('user_id', userId).select('id').maybeSingle();
+    if (result && result.error) return false;
     return Boolean(result?.data?.id);
   }
 

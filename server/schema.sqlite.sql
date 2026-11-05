@@ -105,6 +105,21 @@ CREATE TABLE IF NOT EXISTS watchlists (
   UNIQUE (user_id, secid)
 );
 
+-- 个人 API 密钥：只存 SHA-256 摘要，明文只在生成那一次返回。
+-- digest 唯一让鉴权是一次索引点查；revoked_at 非空即失效（保留行以便审计「谁在何时用过哪把」）。
+CREATE TABLE IF NOT EXISTS api_keys (
+  id           TEXT PRIMARY KEY,
+  user_id      TEXT NOT NULL,
+  name         TEXT,
+  digest       TEXT NOT NULL UNIQUE,
+  hint         TEXT NOT NULL,
+  created_at   TEXT NOT NULL,
+  last_used_at TEXT,
+  revoked_at   TEXT,
+  calls        INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS api_keys_user_idx ON api_keys (user_id);
+
 -- 后台可调参数。只允许「改了只影响未来」的键（费率、担保线、撮合熔断、注册开关等）；
 -- 开户本金这类会重写历史账本的值不在此表，见 users.start_cash。
 CREATE TABLE IF NOT EXISTS settings (
