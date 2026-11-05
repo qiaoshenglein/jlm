@@ -1,6 +1,6 @@
 // 账本层：只依赖不可变的成交流水重放出全部余额，因此不存在「多表写一半」的不一致。
 // 成交记录一旦写入即不可修改；重放是纯函数，任何时候都能从流水复原账户状态。
-import { MICRO, START_CASH, RATE_MARGIN, RATE_SHORT, accruedInterest } from './rules.mjs';
+import { MICRO, START_CASH, START_CASH_USD, accruedInterest, activeParams, marketOf } from './rules.mjs';
 
 const BUY = 'buy';
 const SELL = 'sell';
@@ -8,22 +8,45 @@ const MARGIN_BUY = 'margin_buy';
 const SELL_REPAY = 'sell_repay';
 const SHORT_SELL = 'short_sell';
 const COVER_BUY = 'cover_buy';
+const CAPITAL_IN = 'capital_in';
+const CAPITAL_OUT = 'capital_out';
 
-export const SIDES = [BUY, SELL, MARGIN_BUY, SELL_REPAY, SHORT_SELL, COVER_BUY];
+export const CAPITAL_SIDES = [CAPITAL_IN, CAPITAL_OUT];
+export const SIDES = [BUY, SELL, MARGIN_BUY, SELL_REPAY, SHORT_SELL, COVER_BUY, CAPITAL_IN, CAPITAL_OUT];
 export const SIDE_LABELS = {
   [BUY]: '担保品买入', [SELL]: '担保品卖出', [MARGIN_BUY]: '融资买入',
   [SELL_REPAY]: '卖券还款', [SHORT_SELL]: '融券卖出', [COVER_BUY]: '买券还券',
+  [CAPITAL_IN]: '后台入金', [CAPITAL_OUT]: '后台出金',
 };
 export const isBuySide = (side) => side === BUY || side === MARGIN_BUY || side === COVER_BUY;
 export const usesMargin = (side) => side === MARGIN_BUY || side === SHORT_SELL;
 export const reducesLong = (side) => side === SELL || side === SELL_REPAY;
-export const marginRateOf = (side) => (side === SHORT_SELL ? RATE_SHORT : RATE_MARGIN);
+// 利率按市场各取一份：美股融资利率与 A 股两融利率是两套挂牌值
+export const marginRateOf = (side, market = 'cn') => {
+  const rates = activeParams(market).rates;
+  return side === SHORT_SELL ? rates.short : rates.margin;
+};
+
+// 资金调整流水不属于任何标的：kind='cash_usd' 表示美元池的入金/出金
+export function marketOfTrade(trade) {
+  const symbol = String(trade?.symbol ?? '');
+  if (symbol.startsWith('capital')) return trade?.kind === 'cash_usd' ? 'us' : 'cn';
+  return marketOf(symbol);
+}
+export const tradesOf = (trades, market) => (trades ?? []).filter((trade) => marketOfTrade(trade) === market);
+
+// 开户本金按市场各取一列：老库缺列时回落到当期默认值，等同于「这个账户刚拿到美股子账户」
+export function startCashOf(user, market = 'cn') {
+  const stored = Number(market === 'us' ? user?.start_cash_usd : user?.start_cash);
+  if (Number.isFinite(stored) && stored > 0) return stored;
+  return market === 'us' ? START_CASH_USD : START_CASH;
+}
 
 function bookOf(state, symbol, name, kind) {
   let book = state.books.get(symbol);
   if (!book) {
     book = {
-      symbol, name: name ?? '', kind: kind ?? 'stock',
+      symbol, name: name ?? '', kind: kind ?? 'stock', market: marketOf(symbol),
       qty: 0, cost: 0, todayBought: 0,
       sQty: 0, sPrincipal: 0, sOwn: 0, sOpenMs: 0,
       realized: 0,
@@ -38,9 +61,10 @@ function bookOf(state, symbol, name, kind) {
 // 卖券还款：逐笔冲减融资负债，先结已产生利息（计息起点推到当前），再冲本金
 function repayMarginLots(state, symbol, proceedsMicro, nowMs) {
   let left = Math.max(0, proceedsMicro);
+  const rate = activeParams(marketOf(symbol)).rates.margin;
   for (const lot of state.marginLots) {
     if (lot.symbol !== symbol || lot.principal <= 0 || left <= 0) continue;
-    const due = accruedInterest(lot.principal, lot.openedAt, nowMs, RATE_MARGIN);
+    const due = accruedInterest(lot.principal, lot.openedAt, nowMs, rate);
     if (due > left) break; // 连利息都不够结清，保留该笔继续计息
     left -= due;
     lot.openedAt = nowMs;
@@ -51,9 +75,12 @@ function repayMarginLots(state, symbol, proceedsMicro, nowMs) {
   state.marginLots = state.marginLots.filter((lot) => lot.principal > 0);
 }
 
-// 逐笔重放：trades 必须按 (created_at, id) 升序
-export function replay(trades, { nowMs = Date.now(), today = '' } = {}) {
-  const state = { cash: START_CASH, books: new Map(), marginLots: [], feesPaid: 0, count: 0 };
+// 逐笔重放：trades 必须按 (created_at, id) 升序。
+// startCash 来自 users.start_cash（开户时冻结），后台改默认本金不会重写历史账户的账本。
+export function replay(trades, { nowMs = Date.now(), today = '', startCash = null } = {}) {
+  const seeded = Number(startCash);
+  const cash = Number.isFinite(seeded) && seeded > 0 ? seeded : START_CASH;
+  const state = { cash, startCash: cash, books: new Map(), marginLots: [], feesPaid: 0, count: 0 };
   for (const trade of trades) applyTrade(state, trade, nowMs, today);
   return state;
 }
@@ -66,9 +93,16 @@ export function applyTrade(state, trade, nowMs, today) {
   const amount = Math.trunc(Number(trade.amount) || qty * price);
   const fee = Math.trunc(Number(trade.fee) || 0);
   const leaf = Math.max(1, Math.trunc(Number(trade.leaf) || 1));
+  if (CAPITAL_SIDES.includes(side)) {
+    // 后台资金调整走同一条只追加流水：只动现金、不建仓，重放时与真实成交一样可复现。
+    // 不计入「成交笔数」，那是交易次数，资金进出不是交易。
+    state.cash += (side === CAPITAL_IN ? 1 : -1) * (amount - fee);
+    return true;
+  }
   const own = usesMargin(side) ? Math.round(amount / leaf) : 0;
   const atMs = Date.parse(String(trade.created_at ?? '')) || nowMs;
-  const sameDay = Boolean(today) && String(trade.day ?? '') === today;
+  // T+1 只适用于 A 股；美股当日买入当日可卖，todayBought 恒为 0
+  const sameDay = marketOf(trade.symbol) === 'cn' && Boolean(today) && String(trade.day ?? '') === today;
   const book = bookOf(state, trade.symbol, trade.name, trade.kind);
   state.feesPaid += fee;
   state.count += 1;
@@ -119,7 +153,9 @@ export function applyTrade(state, trade, nowMs, today) {
   return false;
 }
 
+// 可卖数量：A 股受 T+1 约束，美股当日买入当日即可卖
 export function availOf(book) {
+  if (book.market === 'us') return Math.max(0, book.qty);
   return Math.max(0, book.qty - book.todayBought);
 }
 
@@ -195,12 +231,12 @@ export function metricsOf(state, quotes, nowMs = Date.now()) {
   let marginPrincipal = 0, marginInterest = 0, shortFee = 0;
   for (const lot of state.marginLots) {
     marginPrincipal += lot.principal;
-    marginInterest += accruedInterest(lot.principal, lot.openedAt, nowMs, RATE_MARGIN);
+    marginInterest += accruedInterest(lot.principal, lot.openedAt, nowMs, activeParams(marketOf(lot.symbol)).rates.margin);
     debtBySymbol.set(lot.symbol, (debtBySymbol.get(lot.symbol) ?? 0) + lot.principal);
   }
   for (const book of state.books.values()) {
     if (book.sQty > 0 && book.sOpenMs) {
-      shortFee += accruedInterest(book.sPrincipal, book.sOpenMs, nowMs, RATE_SHORT);
+      shortFee += accruedInterest(book.sPrincipal, book.sOpenMs, nowMs, activeParams(book.market).rates.short);
     }
   }
 
@@ -210,9 +246,20 @@ export function metricsOf(state, quotes, nowMs = Date.now()) {
   const totalDebt = marginDebt + shortDebt;
   const netAssets = totalAssets - totalDebt;
 
+  // 强平价按「当前平仓线」随持仓给出，前端不再自己写死 1.3：后台改线值后图表标记会跟着动
+  if (totalDebt > 0) {
+    for (const position of positions) {
+      if (position.side !== 'long') continue;
+      const liquid = activeParams(marketOf(position.symbol)).lines.liquid;
+      const price = Math.round((liquid * totalDebt - (totalAssets - position.value)) / Math.max(1, position.qty));
+      position.liquidationPrice = price > 0 ? price : null;
+    }
+  }
+
   return {
     cash: state.cash, longValue, shortValue, collateral,
     totalAssets, totalDebt, netAssets,
+    startCash: state.startCash ?? START_CASH,
     marginPrincipal, marginInterest, shortDebt, shortFee,
     marginBalance: marginDebt, securityBalance: shortDebt,
     guaranteeRatio: totalDebt > 0 ? totalAssets / totalDebt : null,

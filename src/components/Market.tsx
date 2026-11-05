@@ -2,7 +2,10 @@ import { useEffect, useMemo, useRef, useState, type WheelEvent } from 'react';
 import { api } from '../api';
 import { cachedSeries, loadSeries, prefetchChart } from '../chart-cache';
 import { CandleChart, MiniBar, PriceCell, TrendChart, type Marker } from './charts';
-import { percent, priceText, tone, type Board, type Quote, type SearchRow, type WatchRow } from '../format';
+import {
+  currencyOfSecid, marketOfSecid, percent, priceText, tickOfSecid, tone,
+  type Board, type Quote, type SearchRow, type WatchRow,
+} from '../format';
 
 export type Tab = 'index' | 'etf' | 'stock' | 'gainer' | 'loser' | 'watch' | 'held';
 
@@ -24,7 +27,9 @@ function offlineQuote(row: WatchRow): Quote {
     secid: row.secid, code: row.code, name: row.name, kind: row.kind as Quote['kind'],
     last: 0, prevClose: 0, open: null, high: null, low: null, change: 0, pct: 0,
     volume: 0, amount: 0, turnover: null, marketCap: null,
-    limitUp: 0, limitDown: 0, limitRatio: 0.1, tick: row.kind === 'etf' ? 1_000 : 10_000,
+    // 占位行没有涨跌停概念，一律给 null，由面板显示「—」而不是 0.00
+    limitUp: null, limitDown: null, limitRatio: 0,
+    tick: tickOfSecid(row.secid, row.kind),
     ts: 0, sealedUp: false, sealedDown: false,
   };
 }
@@ -211,7 +216,8 @@ export function MarketPanel({ board, selected, held, watch, watchQuotes, filter,
               (event.target as HTMLInputElement).blur();
             }
           }}
-          aria-label="搜索标的代码、名称或拼音" placeholder="搜索代码 / 名称 / 拼音，如 600519、gzmt、平安"
+          aria-label="搜索标的代码、名称或拼音"
+          placeholder={board?.market === 'us' ? '搜索美股代码或名称，如 AAPL、英伟达' : '搜索代码 / 名称 / 拼音，如 600519、gzmt、平安'}
           className="h-7 w-full rounded border border-hairline bg-raised pl-2 pr-7 text-xs outline-none placeholder:text-ink-dim focus:border-input" />
         {searchText && (
           <button type="button" aria-label="清空搜索" title="清空搜索（Esc）" onClick={() => onSearch('')}
@@ -290,7 +296,7 @@ function Row({ item, selected, inWatch, movable, onMove, onPick, onToggleWatch }
   const quote = item as Partial<Quote>;
   const live = typeof quote.last === 'number' && quote.last > 0;
   const pct = quote.pct ?? 0;
-  const tick = quote.tick ?? (item.kind === 'etf' ? 1_000 : 10_000);
+  const tick = quote.tick ?? tickOfSecid(item.secid, item.kind);
   const cols = 'grid-cols-[minmax(0,1fr)_4.5rem_3.5rem_auto] gap-x-1.5 px-2.5';
   const pick = () => onPick(item);
   return (
@@ -387,17 +393,26 @@ export function DetailPanel({ quote, markers = null, compact = false, onToast }:
     );
   }
 
+  const us = marketOfSecid(quote.secid) === 'us';
+  const cur = currencyOfSecid(quote.secid);
+  const symbol = cur === 'USD' ? '$' : '¥';
+  // 成交量与成交额跟着币种走：美股没有「手」，成交额也是美元
+  // 注意 amount / marketCap 上游给的是「元（美元）」原值而不是微单位，别再过一遍 compact()
+  const volumeText = quote.kind === 'index' ? '—' : `${(quote.volume / 1e4).toFixed(1)}${us ? '万股' : '万手'}`;
+  const amountText = quote.amount > 0 ? `${symbol}${(quote.amount / 1e8).toFixed(2)}亿` : '—';
+  const capText = quote.marketCap === null ? '—' : `${symbol}${(quote.marketCap / 1e8).toFixed(0)}亿`;
   const full = [
     ['今开', priceText(quote.open ?? 0, quote.tick), tone((quote.open ?? 0) - quote.prevClose)],
     ['最高', priceText(quote.high ?? 0, quote.tick), tone((quote.high ?? 0) - quote.prevClose)],
     ['最低', priceText(quote.low ?? 0, quote.tick), tone((quote.low ?? 0) - quote.prevClose)],
     ['昨收', priceText(quote.prevClose, quote.tick), 'text-muted-foreground'],
-    ['涨停', priceText(quote.limitUp, quote.tick), 'text-up'],
-    ['跌停', priceText(quote.limitDown, quote.tick), 'text-down'],
-    ['成交量', quote.kind === 'index' ? '—' : `${(quote.volume / 1e4).toFixed(1)}万手`, 'text-muted-foreground'],
-    ['成交额', quote.amount > 0 ? `${(quote.amount / 1e8).toFixed(2)}亿` : '—', 'text-muted-foreground'],
+    // 美股没有每日涨跌停，给「无」而不是编一个 0.00 的价格
+    ['涨停', quote.limitUp === null ? '无' : priceText(quote.limitUp, quote.tick), 'text-up'],
+    ['跌停', quote.limitDown === null ? '无' : priceText(quote.limitDown, quote.tick), 'text-down'],
+    ['成交量', volumeText, 'text-muted-foreground'],
+    ['成交额', amountText, 'text-muted-foreground'],
     ['换手率', quote.turnover === null ? '—' : `${quote.turnover.toFixed(2)}%`, 'text-muted-foreground'],
-    ['总市值', quote.marketCap === null ? '—' : `${(quote.marketCap / 1e8).toFixed(0)}亿`, 'text-muted-foreground'],
+    ['总市值', capText, 'text-muted-foreground'],
   ] as const;
   // 手机上只留一行四项，其余高度全部让给图形
   const cells = compact
@@ -405,7 +420,7 @@ export function DetailPanel({ quote, markers = null, compact = false, onToast }:
       ['昨收', priceText(quote.prevClose, quote.tick), 'text-muted-foreground'],
       ['最高', priceText(quote.high ?? 0, quote.tick), tone((quote.high ?? 0) - quote.prevClose)],
       ['最低', priceText(quote.low ?? 0, quote.tick), tone((quote.low ?? 0) - quote.prevClose)],
-      ['成交额', quote.amount > 0 ? `${(quote.amount / 1e8).toFixed(2)}亿` : '—', 'text-muted-foreground'],
+      ['成交额', amountText, 'text-muted-foreground'],
     ] as const)
     : full;
 
@@ -414,7 +429,10 @@ export function DetailPanel({ quote, markers = null, compact = false, onToast }:
       <header className="flex shrink-0 flex-wrap items-end gap-x-6 gap-y-2 border-b border-hairline px-4 py-2.5">
         <div>
           <h2 className="text-base">{quote.name}<span className="num ml-2 text-xs text-ink-dim">{quote.code}</span></h2>
-          <p className="text-[0.75rem] text-ink-dim">沪深实时行情 · 涨跌停 {percent(quote.limitRatio * 100, 0)} · 股票 T+1 交收</p>
+          <p className="text-[0.75rem] text-ink-dim">
+            {us ? '美股实时行情 · 无每日涨跌停 · T+0 交收 · 1 股起'
+              : `沪深实时行情 · 涨跌停 ${percent(quote.limitRatio * 100, 0)} · 股票 T+1 交收`}
+          </p>
         </div>
         <div className={`num flex items-baseline gap-3 ${tone(quote.pct)}`}>
           <span className={`leading-none ${compact ? 'text-2xl' : 'text-3xl'}`}>{priceText(quote.last, quote.tick)}</span>

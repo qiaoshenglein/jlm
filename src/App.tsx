@@ -1,21 +1,24 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { toast } from 'sonner';
-import { ApiError, api, readToken, setServerReasons, writeToken } from './api';
+import { ApiError, api, currentMarket, readToken, setMarket as writeMarket, setServerReasons, writeToken } from './api';
 import { Auth } from './components/Auth';
 import { Book } from './components/Book';
 import { DetailPanel, MarketPanel, Tape, type Tab } from './components/Market';
+import { Admin } from './components/Admin';
 import { Rules } from './components/Rules';
 import { Ticket } from './components/Ticket';
 import {
-  SIDE_LABEL, SESSION_LABEL, Y, compact, money, ratioText, shares, tone,
-  type Account, type Board, type Clock, type OrderRow, type Quote, type SearchRow,
-  type Session, type SyncResponse, type TradeRow, type WatchRow,
+  MARKET_NAME, SESSION_LABEL, SIDE_LABEL, Y, compact, currencyOfSecid, isCapitalSide, marketOfSecid,
+  money, percent, priceText, ratioText, sessionLabel, shares, tickOfSecid, tone,
+  DEFAULT_LINES,
+  type Account, type Board, type Clock, type DeskParams, type Lines, type Market, type MarketStatus,
+  type OrderRow, type Quote, type SearchRow, type Session, type SideView, type SyncResponse, type TradeRow, type WatchRow,
 } from './format';
 import type { Marker } from './components/charts';const DENSITY = ['compact', 'standard', 'roomy'] as const;
 const SYNC_MS = 3_000;
 const PUBLIC_MS = 10_000;
 const START_CASH = 1_000_000_000_000; // 100 万虚拟本金（微元）
-type User = { id: string; username: string; display: string };export default function App() {
+type User = { id: string; username: string; display: string; role?: 'user' | 'admin'; status?: 'active' | 'frozen' };export default function App() {
   const [user, setUser] = useState<User | null>(null);
   const [account, setAccount] = useState<Account | null>(null);
   const [board, setBoard] = useState<Board | null>(null);
@@ -27,7 +30,14 @@ type User = { id: string; username: string; display: string };export default fun
   const [curve, setCurve] = useState<SyncResponse['curve']>([]);
   const [leader, setLeader] = useState<SyncResponse['leader']>([]);
   const [matchable, setMatchable] = useState(false);
+  const [paused, setPaused] = useState(false); // 后台的撮合熔断开关，与「休市」是两件事，分开显示
   const [stale, setStale] = useState(false);
+  // 当前市场：沪深用人民币账，美股用美元账，两边互不挪用
+  const [market, setMarket] = useState<Market>(() => currentMarket());
+  const [side, setSide] = useState<SideView | null>(null);
+  const [combined, setCombined] = useState<SyncResponse['combined'] | null>(null);
+  const [markets, setMarkets] = useState<Record<Market, MarketStatus> | null>(null);
+  const [fx, setFx] = useState(0);
   const [reasons, setReasons] = useState<Record<string, string> | null>(null);
   const [selected, setSelected] = useState('');
   const [resolved, setResolved] = useState<Quote | null>(null);
@@ -40,6 +50,7 @@ type User = { id: string; username: string; display: string };export default fun
   const [banner, setBanner] = useState('');
   const [showRules, setShowRules] = useState(false);
   const [visibleRows, setVisibleRows] = useState<{ secid: string }[]>([]);
+  const [lines, setLines] = useState<Lines>(DEFAULT_LINES); // 风控线由后台热改，标签与刻度跟着走
   const [density, setDensity] = useState<'compact' | 'standard' | 'roomy'>(() => {
     const saved = typeof localStorage !== 'undefined' ? localStorage.getItem('mirror.desk.density') : null;
     return saved === 'compact' || saved === 'roomy' || saved === 'standard' ? saved : 'standard';
@@ -47,35 +58,68 @@ type User = { id: string; username: string; display: string };export default fun
   const [resolving, setResolving] = useState(false);
   const [signingOut, setSigningOut] = useState(false);
   const [view, setView] = useState<'quote' | 'trade' | 'account'>('quote');
+  const [route, setRoute] = useState(() => (typeof window === 'undefined' ? '' : window.location.hash));
+  useEffect(() => {
+    const onHash = () => setRoute(window.location.hash);
+    window.addEventListener('hashchange', onHash);
+    return () => window.removeEventListener('hashchange', onHash);
+  }, []);
   const mobile = useMedia('(max-width: 1023px)');
   const busy = useRef(false);
   const polling = useRef<number | null>(null);
-  const applyEnvelope = useCallback((payload: { market: Board; session: Session; clock: Clock; matchable: boolean; stale: boolean }) => {
+  const cur = market === 'us' ? 'USD' : 'CNY';
+  const applyEnvelope = useCallback((payload: {
+    market: Board; session: Session; clock: Clock; matchable: boolean; matchPaused?: boolean; stale: boolean;
+    side?: SideView; combined?: SyncResponse['combined']; markets?: Record<Market, MarketStatus>; fx?: number;
+  }) => {
     setBoard(payload.market);
     setSession(payload.session);
     setClock(payload.clock);
     setMatchable(payload.matchable);
+    setPaused(Boolean(payload.matchPaused));
     setStale(payload.stale);
+    setSide(payload.side ?? null);
+    setCombined(payload.combined ?? null);
+    if (payload.markets) setMarkets(payload.markets);
+    if (payload.fx) setFx(payload.fx);
   }, []);  // 首轮同步不受可见性影响，否则用户从后台标签页打开时会先看到 0.00
+  const applyParams = useCallback((payload: { params?: DeskParams }) => {
+    const next = payload.params?.lines;
+    if (!next) return;
+    // 值没变就保持同一引用，避免每 3 秒一次的同步白白重渲染
+    setLines((prev) => (prev.liquid === next.liquid && prev.call === next.call
+      && prev.warn === next.warn && prev.open === next.open && prev.withdraw === next.withdraw ? prev : next));
+  }, []);
   const syncNow = useCallback(async () => {
     if (busy.current) return;
     busy.current = true;
     try {
       const result = await api<SyncResponse>('sync', {}, true);
       setAccount(result.account);
+      // 角色与冻结状态由后台改，靠这一路带回来；没变化时保持同一引用，不做无谓重渲染
+      setUser((prev) => (prev && prev.role === result.user?.role && prev.status === result.user?.status
+        ? prev : { ...prev, ...result.user }));
       setOrders(result.orders);
       setTrades(result.trades);
       setEvents(result.events);
       setCurve(result.curve);
       setLeader(result.leader);
       applyEnvelope(result);
+      applyParams(result);
       setBanner('');
       setWatch(result.watch ?? []);
       setWatchQuotes(result.watchQuotes ?? []);
       for (const fill of result.fills ?? []) {
         knownWatch.current.add(fill.id);
-        toast.success(`${SIDE_LABEL[fill.side] ?? fill.side}成交：${fill.name} ${shares(fill.qty)} 股 @ ${((fill.price ?? 0) / Y).toFixed(fill.kind === 'etf' ? 3 : 2)}`, {
-          description: `成交金额 ¥${money(fill.amount)} · 费用 ¥${money(fill.fee)}${fill.leaf > 1 ? ` · ${fill.leaf}× 杠杆` : ''}`,
+        const fillCur = fill.currency ?? currencyOfSecid(fill.secid);
+        if (isCapitalSide(fill.side)) {
+          toast.info(`后台${fill.side === 'capital_out' ? '出金' : '入金'} ${money(fill.amount, fillCur)}`, {
+            description: '由管理员调整，已作为资金流水入账', duration: 8000, id: `fill-${fill.id}`,
+          });
+          continue;
+        }
+        toast.success(`${SIDE_LABEL[fill.side] ?? fill.side}成交：${fill.name} ${shares(fill.qty)} 股 @ ${priceText(fill.price, tickOfSecid(fill.secid, fill.kind))}`, {
+          description: `成交金额 ${money(fill.amount, fillCur)} · 费用 ${money(fill.fee, fillCur)}${fill.leaf > 1 ? ` · ${fill.leaf}× 杠杆` : ''}`,
           duration: 6000, id: `fill-${fill.id}`,
         });
       }
@@ -100,7 +144,22 @@ type User = { id: string; username: string; display: string };export default fun
     } finally {
       busy.current = false;
     }
-  }, [applyEnvelope]);  useEffect(() => {
+  }, [applyEnvelope, applyParams]);
+
+  // 切市场：先记住选择并立刻换上下文，行情/账本各归各的池子，不能拿 A 股的持仓去配美元的委托
+  const switchMarket = useCallback((next: Market) => {
+    if (next === currentMarket()) return;
+    writeMarket(next);
+    setMarket(next);
+    setSelected('');
+    setResolved(null);
+    setSearch('');
+    setWatch([]);
+    setWatchQuotes([]);
+    setOrders([]);
+    setTrades([]);
+    void syncNow();
+  }, [syncNow]);  useEffect(() => {
     document.documentElement.dataset.density = density;
     try { localStorage.setItem('mirror.desk.density', density); } catch { /* 隐私模式下仅本次生效 */ }
   }, [density]);
@@ -122,8 +181,11 @@ type User = { id: string; username: string; display: string };export default fun
     return () => { live = false; window.clearInterval(timer); };
   }, [user, applyEnvelope]);  // 恢复会话 + 拉取服务端错误码文案
   useEffect(() => {
-    void api<{ rules: { reasons: Record<string, string> } }>('rules', {}, true)
-      .then((result) => { setReasons(result.rules.reasons); setServerReasons(result.rules.reasons); })
+    void api<{ rules: { reasons: Record<string, string>; lines: Lines } }>('rules', {}, true)
+      .then((result) => {
+        setReasons(result.rules.reasons); setServerReasons(result.rules.reasons);
+        if (result.rules.lines) setLines(result.rules.lines);
+      })
       .catch(() => undefined);
     if (!readToken()) return;
     void api<SyncResponse & { user: User }>('me', {}, true)
@@ -131,9 +193,10 @@ type User = { id: string; username: string; display: string };export default fun
         setUser(result.user);
         setAccount(result.account);
         applyEnvelope(result);
+        applyParams(result);
       })
       .catch(() => writeToken(null));
-  }, [applyEnvelope]);  // 登录后开始撮合轮询；标签页隐藏时暂停，回到前台立即补一轮
+  }, [applyEnvelope, applyParams]);  // 登录后开始撮合轮询；标签页隐藏时暂停，回到前台立即补一轮
   useEffect(() => {
     if (!user) {
       if (polling.current) window.clearInterval(polling.current);
@@ -180,18 +243,31 @@ type User = { id: string; username: string; display: string };export default fun
       }
       if (event.key === '1' || event.key === '2' || event.key === '3') {
         setView((['quote', 'trade', 'account'] as const)[Number(event.key) - 1]);
+        return;
+      }
+      // M 切市场：中美时段互补，晚上从 A 股切到美股是最常用的一步
+      if (event.key === 'm' || event.key === 'M') {
+        event.preventDefault();
+        switchMarket(market === 'us' ? 'cn' : 'us');
       }
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [mobile, selected, showRules, visibleRows, user]);
+  }, [market, mobile, selected, showRules, switchMarket, visibleRows, user]);
 
   async function submitAuth(action: 'login' | 'register', payload: Record<string, string>) {
-    const result = await api<{ token: string; user: User }>(action, payload);
+    const result = await api<{
+      token: string; user: User; accounts?: Record<Market, Account>;
+    }>(action, payload);
     writeToken(result.token);
     setUser(result.user);
-    setAccount(null);
-    toast.success(action === 'register' ? '开户完成，100 万虚拟本金已到账' : `欢迎回来，${result.user.display}`);
+    // 开户直接铺上当前市场那份账，省掉一次「先看到 0.00 再等同步」的空窗
+    setAccount(result.accounts ? result.accounts[market] ?? null : null);
+    toast.success(action === 'register'
+      ? (result.accounts
+        ? `开户完成：人民币子账户 ${money(result.accounts.cn.netAssets, 'CNY')} · 美元子账户 ${money(result.accounts.us.netAssets, 'USD')}`
+        : '开户完成，两个市场的虚拟本金已到账')
+      : `欢迎回来，${result.user.display}`);
   }  async function logout() {
     setSigningOut(true);
     try { await api('logout'); } catch { /* 令牌已在本地清除 */ }
@@ -252,26 +328,37 @@ type User = { id: string; username: string; display: string };export default fun
     } catch (error) {
       toast.error(error instanceof ApiError ? error.message : '撤单未成功');
     }
-  }  // 交易范围不限于行情池：任意 6 位代码都能即时取价下单
+  }  // 交易范围不限于行情池：A 股任意 6 位代码、美股任意股票代码都能即时取价下单
   async function resolveSymbol(code: string): Promise<Quote | null> {
     const clean = code.trim();
-    if (!/^\d{6}$/.test(clean)) return null;
+    const us = market === 'us';
+    if (us ? !/^[A-Za-z][A-Za-z0-9._-]{0,9}$/.test(clean) : !/^\d{6}$/.test(clean)) return null;
     const pool = [...(board?.indexes ?? []), ...(board?.etfs ?? []), ...(board?.stocks ?? [])];
-    const known = pool.find((quote) => quote.code === clean);
+    const known = pool.find((quote) => quote.code.toUpperCase() === clean.toUpperCase());
     if (known) { setSelected(known.secid); setResolved(null); return known; }
     setResolving(true);
     try {
-      const secid = `${/^[569]/.test(clean) ? '1' : '0'}.${clean}`;
+      // A 股可按首位数字猜交易所，美股同一代码分散在三个交易所，只能交给检索接口定位
+      const secid = us ? await findUsSecid(clean) : `${/^[569]/.test(clean) ? '1' : '0'}.${clean}`;
+      if (!secid) throw new ApiError(`未找到 ${clean}，请确认它已在纳斯达克或纽交所上市`, 'unknown_symbol');
       const result = await api<{ quote: Quote }>('lookup', { secid });
       setSelected(result.quote.secid);
       setResolved(result.quote);
       return result.quote;
     } catch (error) {
-      toast.error(error instanceof ApiError ? error.message : `未找到 ${clean}，请确认代码属于沪、深或北交所`);
+      toast.error(error instanceof ApiError ? error.message : `未找到 ${clean}，请确认代码${us ? '上市地点' : '属于沪、深或北交所'}`);
       return null;
     } finally {
       setResolving(false);
     }
+  }
+
+  async function findUsSecid(symbol: string): Promise<string | null> {
+    const hit = await api<{ rows: SearchRow[] }>('search', { q: symbol });
+    const rows = hit.rows ?? [];
+    const tradable = rows.filter((row) => row.kind !== 'index');
+    return tradable.find((row) => row.code.toUpperCase() === symbol.toUpperCase())?.secid
+      ?? tradable[0]?.secid ?? null;
   }
   if (!user) return <Auth board={board} session={session} onSubmit={submitAuth} />;
   // 持仓标的即使不在行情池里也要能显示与切换，用持仓字段合成
@@ -281,22 +368,27 @@ type User = { id: string; username: string; display: string };export default fun
     last: position.price, prevClose: position.prevClose ?? position.price,
     open: null, high: null, low: null, change: 0, pct: position.pct,
     volume: 0, amount: 0, turnover: null, marketCap: null,
-    limitUp: position.limitUp ?? position.price, limitDown: position.limitDown ?? position.price,
-    limitRatio: 0.1, tick: position.kind === 'etf' ? 1_000 : 10_000,
+    // 美股没有当日涨跌停，持仓合成时保持 null，别让价格标签长出「涨停」两个字
+    limitUp: marketOfSecid(position.symbol) === 'us' ? null : position.limitUp ?? position.price,
+    limitDown: marketOfSecid(position.symbol) === 'us' ? null : position.limitDown ?? position.price,
+    limitRatio: marketOfSecid(position.symbol) === 'us' ? 0 : 0.1,
+    tick: tickOfSecid(position.symbol, position.kind),
     ts: 0, sealedUp: false, sealedDown: false,
   }));
   const pool = [...(board?.indexes ?? []), ...(board?.stocks ?? []), ...(board?.etfs ?? []), ...heldQuotes];
   const selectedQuote = resolved && resolved.secid === selected ? resolved
     : pool.find((quote) => quote.secid === selected) ?? null;
   const ratio = account?.guaranteeRatio ?? null;
-  const ret = account ? account.netAssets / START_CASH - 1 : 0;
+  // 收益率看合并口径：两个子账户按同一汇率折成人民币，切市场不会再让数字跳一大截
+  const base = combined?.startCash ?? account?.startCash ?? START_CASH;
+  const netForRet = combined?.netAssets ?? account?.netAssets ?? 0;
+  const ret = base > 0 ? netForRet / base - 1 : 0;
   const position = (account?.positions ?? []).find((item) => item.symbol === selected) ?? null;
   const markers: Marker[] = [];
   if (position && account) {
     markers.push({ price: position.avgCost, label: position.side === 'long' ? '成本' : '券成本', tone: 'cost' });
-    if (position.side === 'long' && account.totalDebt > 0) {
-      const others = account.totalAssets - position.value;
-      const liq = Math.round((1.3 * account.totalDebt - others) / Math.max(1, position.qty));
+    if (position.side === 'long' && position.liquidationPrice) {
+      const liq = position.liquidationPrice;
       if (liq > 0 && liq < position.price) markers.push({ price: liq, label: '强平', tone: 'liq' });
     }
   }
@@ -306,7 +398,7 @@ type User = { id: string; username: string; display: string };export default fun
     setResolved(null);
     if (mobile) setView('trade'); // 手机上选完标的直接进下单页，省一次滚动
   };
-  const market = (
+  const marketPanel = (
     <MarketPanel board={board} selected={selected} held={heldQuotes}
       watch={watch} watchQuotes={watchQuotes} compact={mobile}
       filter={filter} onFilter={setFilter} onSelect={pickSymbol}
@@ -315,12 +407,13 @@ type User = { id: string; username: string; display: string };export default fun
   );
   const detail = <DetailPanel quote={selectedQuote} markers={markers} compact={mobile} onToast={(message) => toast(message)} />;
   const book = (
-    <Book account={account} orders={orders} trades={trades} events={events}
-      curve={curve} leader={leader} startCash={START_CASH} today={clock?.day ?? session?.day ?? ''}
+    <Book account={account} orders={orders} trades={trades} events={events} lines={lines}
+      curve={curve} leader={leader} startCash={account?.startCash ?? START_CASH} today={clock?.day ?? session?.day ?? ''}
+      market={market} side={side} combined={combined}
       onSelect={pickSymbol} onCancel={(id) => void cancelOrder(id)} />
   );
   const ticket = (
-    <Ticket quote={selectedQuote} account={account} held={heldQuotes} resolving={resolving}
+    <Ticket quote={selectedQuote} account={account} held={heldQuotes} lines={lines} resolving={resolving}
       onResolve={resolveSymbol} onFilled={(message) => toast.success(message)}
       onDuplicate={(confirm) => toast.warning('已有一笔完全相同的委托', {
         description: '15 秒内重复提交，通常是连点。确实要再来一笔请点确认。',
@@ -328,34 +421,39 @@ type User = { id: string; username: string; display: string };export default fun
         action: { label: '确认重复下单', onClick: () => confirm() },
       })} />
   );
+  const onAdmin = route.startsWith('#/admin') && user.role === 'admin';
+  const frozen = user.status === 'frozen';
   return (
-    <div className={`flex flex-col ${mobile ? 'h-dvh overflow-hidden' : 'min-h-dvh'}`}>
+    <div className={`flex flex-col ${mobile || onAdmin ? 'h-dvh overflow-hidden' : 'min-h-dvh'}`}>
       <header className={`z-20 border-b border-hairline bg-background/92 backdrop-blur ${mobile ? 'shrink-0' : 'sticky top-0'}`}>
         <div className={`flex flex-wrap items-center gap-y-1 ${mobile ? 'gap-x-2 px-3 py-1.5' : 'gap-x-4 px-4 py-2'}`}>
           <div className="flex items-baseline gap-2 border-l-2 border-primary pl-2">
             <span className={`font-semibold tracking-[0.2em] ${mobile ? 'text-[1.0625rem]' : 'text-[1.1875rem]'}`}>镜盘</span>
             {!mobile && <span className="num text-[0.625rem] tracking-[0.25em] text-primary">MIRROR DESK</span>}
-          </div>          <span className={`chip num ${matchable ? 'border-down/40 bg-down/12 text-down' : 'border-hairline bg-muted text-muted-foreground'}`}>
-            <span className={`inline-block size-1.5 rounded-full ${matchable ? 'bg-down' : 'bg-flat'}`} />
-            {session ? SESSION_LABEL[session.phase] : '—'}
-            <span className="opacity-70">{clock?.stamp.slice(11) ?? session?.stamp.slice(11) ?? ''}</span>
-          </span>
-          {stale && <span className="chip border-warn/45 bg-warn/12 text-warn">行情非当日数据 · 休市不撮合</span>}          <div className="num ml-auto flex flex-wrap items-center gap-x-4 gap-y-1">
+          </div>          <MarketChips markets={markets} active={market} compact={mobile} onPick={switchMarket} />
+          {stale && <span className="chip border-warn/45 bg-warn/12 text-warn">{MARKET_NAME[market]}行情非当日数据 · 休市不撮合</span>}          {paused && <span className="chip border-warn/60 bg-warn/15 text-warn">后台已暂停{MARKET_NAME[market]}撮合 · 新委托会被拒</span>}          <div className="num ml-auto flex flex-wrap items-center gap-x-4 gap-y-1">
             <span className="flex flex-col items-end leading-tight">
-              <span className="text-[0.6562rem] tracking-[0.06em] text-ink-dim">净资产</span>
-              <span className="text-[1.0625rem] font-semibold">{money(account?.netAssets ?? 0)}</span>
+              <span className="text-[0.6562rem] tracking-[0.06em] text-ink-dim">折合人民币净资产</span>
+              <span className="text-[1.0625rem] font-semibold">{money(combined?.netAssets ?? account?.netAssets ?? 0, 'CNY')}</span>
             </span>
             <span className="flex flex-col items-end leading-tight">
-              <span className="text-[0.6562rem] tracking-[0.06em] text-ink-dim">可用</span>
-              <span className="text-[0.875rem]">{money(account?.cash ?? 0)}</span>
+              <span className="text-[0.6562rem] tracking-[0.06em] text-ink-dim">{MARKET_NAME[market]}可用</span>
+              <span className="text-[0.875rem]">{money(account?.cash ?? 0, cur)}</span>
             </span>
             {(account?.totalDebt ?? 0) > 0 && (
               <span className="flex flex-col items-end leading-tight">
                 <span className="text-[0.6562rem] tracking-[0.06em] text-ink-dim">总负债</span>
-                <span className="text-[0.875rem] text-warn">{money(account?.totalDebt ?? 0)}</span>
+                <span className="text-[0.875rem] text-warn">{money(account?.totalDebt ?? 0, cur)}</span>
               </span>
             )}
-            <Gauge ratio={ratio} ret={ret} compact={mobile} />
+            {side && (
+              <button type="button" onClick={() => switchMarket(side.market)} title={`切换到${MARKET_NAME[side.market]}子账户`}
+                className="flex flex-col items-end leading-tight text-ink-dim transition hover:text-foreground">
+                <span className="text-[0.6562rem] tracking-[0.06em]">{MARKET_NAME[side.market]}净资产</span>
+                <span className="text-[0.875rem]">{money(side.netAssets, side.currency)}</span>
+              </button>
+            )}
+            <Gauge ratio={ratio} ret={ret} compact={mobile} lines={lines} market={market} />
             {mobile ? (
               <button type="button" onClick={() => setDensity(DENSITY[(DENSITY.indexOf(density) + 1) % 3])}
                 aria-label={`行距密度：${density === 'compact' ? '紧凑' : density === 'roomy' ? '宽松' : '标准'}，点击切换`}
@@ -373,6 +471,12 @@ type User = { id: string; username: string; display: string };export default fun
                 ))}
               </span>
             )}
+            {user.role === 'admin' && (
+              <button type="button" onClick={() => { window.location.hash = onAdmin ? '' : '#/admin'; }}
+                className={`chip transition-colors duration-75 active:translate-y-px ${onAdmin ? 'border-primary bg-primary/15 text-primary' : 'border-primary/50 text-primary hover:bg-primary/12'}`}>
+                {onAdmin ? '返回交易台' : '后台'}
+              </button>
+            )}
             <button type="button" onClick={() => setShowRules(true)}
               className="chip border-hairline text-muted-foreground transition hover:border-input hover:text-foreground">规则</button>
             {!mobile && <span className="max-w-[10ch] truncate text-[0.8125rem]">{user.display}</span>}
@@ -383,12 +487,20 @@ type User = { id: string; username: string; display: string };export default fun
           </div>
         </div>
         <Tape indexes={board?.indexes ?? []} />
-      </header>      {banner && <p role="alert" className="border-b border-up/40 bg-up/10 px-4 py-1.5 text-xs text-up">{banner}</p>}      {mobile ? (
+      </header>      {(banner || frozen) && (
+        <p role="alert" className="border-b border-up/40 bg-up/10 px-4 py-1.5 text-xs text-up">
+          {banner || '该账户已被后台冻结：不能下单，撤单与查询仍可用'}
+        </p>
+      )}      {onAdmin ? (
+        <main className="flex min-h-0 flex-1 flex-col p-3">
+          <Admin onExit={() => { window.location.hash = ''; }} />
+        </main>
+      ) : mobile ? (
         <main className="min-h-0 flex-1 overflow-hidden p-2">
           {view === 'quote' && (
             <div className="view-in flex h-full min-h-0 flex-col gap-2">
               <div className="h-[40%] min-h-[176px] shrink-0">{detail}</div>
-              <div className="min-h-0 flex-1">{market}</div>
+              <div className="min-h-0 flex-1">{marketPanel}</div>
             </div>
           )}
           {view === 'trade' && <div className="view-in h-full">{ticket}</div>}
@@ -396,7 +508,7 @@ type User = { id: string; username: string; display: string };export default fun
         </main>
       ) : (
         <main className="grid flex-1 gap-3 p-3 lg:h-[calc(100dvh-108px)] lg:min-h-0 lg:flex-none lg:grid-rows-[minmax(0,1fr)] lg:grid-cols-[minmax(230px,18rem)_minmax(0,1fr)_minmax(300px,21rem)] lg:overflow-hidden">
-          {market}
+          {marketPanel}
           <div className="scrollbar-thin flex min-h-0 flex-col gap-3 lg:overflow-y-auto">
             <div className="min-h-[320px] flex-[6]">{detail}</div>
             <div className="min-h-[260px] flex-[5]">{book}</div>
@@ -425,11 +537,16 @@ type User = { id: string; username: string; display: string };export default fun
             <kbd className="ml-2 rounded border border-hairline px-1">滚轮</kbd> 翻页
             <kbd className="ml-2 rounded border border-hairline px-1">B/S</kbd> 方向
             <kbd className="ml-2 rounded border border-hairline px-1">1-5</kbd> 杠杆
+            <kbd className="ml-2 rounded border border-hairline px-1">M</kbd> 切市场
             <kbd className="ml-2 rounded border border-hairline px-1">Enter</kbd> 下单
           </span>
-          行情源：东方财富公开接口 · 每 {SYNC_MS / 1000} 秒撮合一轮 · 市价单以最新价全额成交 · 股票 T+1 · 涨跌停与两融担保比例按真实规则校验 · 虚拟资金，不构成投资建议
+          行情源：东方财富公开接口 · 每 {SYNC_MS / 1000} 秒撮合一轮 · 市价单以最新价全额成交 ·
+          {market === 'us'
+            ? ' 美股 T+0、1 股起、无每日涨跌停，两融与担保比例按 Reg T 口径'
+            : ' 股票 T+1、100 股一手，涨跌停与两融担保比例按真实规则校验'} ·
+          {fx > 0 ? ` · 美元折人民币 ${(fx / Y).toFixed(4)}` : ''} · 虚拟资金，不构成投资建议
         </footer>
-      )}      {showRules && <Rules extra={reasons} onClose={() => setShowRules(false)} />}
+      )}      {showRules && <Rules extra={reasons} market={market} onClose={() => setShowRules(false)} />}
     </div>
   );
 }// 断点用 JS 判定：移动端要换成「底部导航 + 单视图填满视口」的外壳，纯 CSS 切不出这种结构
@@ -443,22 +560,73 @@ function useMedia(query: string) {
     return () => mq.removeEventListener('change', sync);
   }, [query]);
   return matches;
-}/** 维持担保比例仪表签：一条迷你刻度 + 阶梯线，比纯数字更快判断风险 */
-function Gauge({ ratio, ret, compact }: { ratio: number | null; ret: number; compact: boolean }) {
-  const pct = ratio === null ? null : Math.max(0, Math.min(1, (ratio - 1.1) / 1.5));
-  const tone = ratio === null ? 'text-muted-foreground' : ratio < 1.3 ? 'text-up' : ratio < 1.4 ? 'text-warn' : 'text-down';
+}/** 市场开关即双市时段状态：中美时段互补，两个 chip 同时说清「哪边在交易、我现在看哪边」 */
+const PHASE_SHORT: Record<string, string> = {
+  open: '盘中', auction: '竞价', lunch: '午休', closed: '收盘', pre: '盘前', after: '盘后',
+};
+
+function MarketChips({ markets, active, compact, onPick }: {
+  markets: Record<Market, MarketStatus> | null;
+  active: Market;
+  compact: boolean;
+  onPick: (market: Market) => void;
+}) {
+  if (!markets) {
+    return (
+      <span role="group" aria-label="交易市场" className="chip gap-0.5 border-hairline p-0.5">
+        {(['cn', 'us'] as Market[]).map((item) => (
+          <button key={item} type="button" onClick={() => onPick(item)} aria-pressed={item === active}
+            className={`rounded px-2 py-1 text-[0.75rem] ${item === active ? 'bg-primary/20 text-primary' : 'text-ink-dim hover:text-foreground'}`}>
+            {MARKET_NAME[item]}
+          </button>
+        ))}
+      </span>
+    );
+  }
+  return (
+    <span role="group" aria-label="交易市场与开市状态" className="flex items-center gap-1">
+      {(['cn', 'us'] as Market[]).map((item) => {
+        const status = markets[item];
+        const on = item === active;
+        const label = compact ? (PHASE_SHORT[status?.session.phase] ?? '收盘')
+          : sessionLabel(item, status?.session.phase);
+        return (
+          <button key={item} type="button" onClick={() => onPick(item)} aria-pressed={on}
+            title={`${MARKET_NAME[item]}子账户 · ${status?.currency} · ${status?.day ?? ''}`}
+            className={`chip num min-h-7 border transition-colors duration-75 active:translate-y-px ${status?.matchable
+              ? 'border-down/40 bg-down/12 text-down' : 'border-hairline bg-muted text-muted-foreground'} ${on
+              ? 'ring-1 ring-primary/50' : 'opacity-75 hover:opacity-100'}`}>
+            <span className={`inline-block size-1.5 rounded-full ${status?.matchable ? 'bg-down' : 'bg-flat'}`} />
+            {MARKET_NAME[item]} {label}
+            {on && status?.matchable && <span className="opacity-70">{status.session.stamp.slice(11, 16)}</span>}
+          </button>
+        );
+      })}
+    </span>
+  );
+}
+
+/** 维持担保比例仪表签：一条迷你刻度 + 阶梯线，比纯数字更快判断风险 */
+function Gauge({ ratio, ret, compact, lines, market }: {
+  ratio: number | null; ret: number; compact: boolean; lines: Lines; market: Market;
+}) {
+  const from = 1.1;
+  const to = Math.max(2.6, lines.open + 0.5);
+  const span = to - from;
+  const pct = ratio === null ? null : Math.max(0, Math.min(1, (ratio - from) / span));
+  const tone = ratio === null ? 'text-muted-foreground' : ratio < lines.liquid ? 'text-up' : ratio < lines.call ? 'text-warn' : 'text-down';
   return (
     <span className={`flex items-end gap-2 ${compact ? '' : 'border-l border-hairline pl-4'}`}>
       <span className="flex flex-col items-end leading-tight">
-        <span className="text-[0.6562rem] tracking-[0.06em] text-ink-dim">维持担保比例</span>
+        <span className="text-[0.6562rem] tracking-[0.06em] text-ink-dim">{MARKET_NAME[market]}维持担保比例</span>
         <span className={`text-[0.9375rem] font-semibold ${tone}`}>{ratioText(ratio)}</span>
       </span>
       {!compact && (
         <span className="relative mb-1 block h-1.5 w-16 overflow-hidden rounded-full bg-muted" aria-hidden="true">
-          {[1.3, 1.4, 1.5].map((line) => (
-            <span key={line} className="absolute inset-y-0 w-px bg-foreground/35" style={{ left: `${((line - 1.1) / 1.5) * 100}%` }} />
+          {[lines.liquid, lines.call, lines.warn].map((line, index) => (
+            <span key={index} className="absolute inset-y-0 w-px bg-foreground/35" style={{ left: `${((line - from) / span) * 100}%` }} />
           ))}
-          {pct !== null && <span className={`absolute inset-y-0 left-0 rounded-full ${ratio! < 1.3 ? 'bg-up' : ratio! < 1.4 ? 'bg-warn' : 'bg-down'}`} style={{ width: `${pct * 100}%` }} />}
+          {pct !== null && <span className={`absolute inset-y-0 left-0 rounded-full ${ratio! < lines.liquid ? 'bg-up' : ratio! < lines.call ? 'bg-warn' : 'bg-down'}`} style={{ width: `${pct * 100}%` }} />}
         </span>
       )}
       <span className={`chip num mb-0.5 ${ret >= 0 ? 'border-up/40 bg-up/12 text-up' : 'border-down/40 bg-down/12 text-down'}`}>

@@ -12,7 +12,11 @@ CREATE TABLE IF NOT EXISTS app.users (
   created_at   TIMESTAMPTZ NOT NULL,
   last_login   TIMESTAMPTZ,
   fail_count   INTEGER NOT NULL DEFAULT 0,
-  locked_until TIMESTAMPTZ
+  locked_until TIMESTAMPTZ,
+  role         TEXT NOT NULL DEFAULT 'user',
+  status       TEXT NOT NULL DEFAULT 'active',
+  start_cash   BIGINT,
+  start_cash_usd BIGINT
 );
 
 CREATE TABLE IF NOT EXISTS app.sessions (
@@ -102,3 +106,22 @@ CREATE TABLE IF NOT EXISTS app.watchlists (
   created_at TIMESTAMPTZ NOT NULL,
   UNIQUE (user_id, secid)
 );
+
+CREATE TABLE IF NOT EXISTS app.settings (
+  key        TEXT PRIMARY KEY,
+  value      TEXT NOT NULL,
+  updated_by TEXT,
+  updated_at TIMESTAMPTZ NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS app.audit (
+  id         TEXT PRIMARY KEY,
+  actor_id   TEXT,
+  actor      TEXT,
+  action     TEXT NOT NULL,
+  target     TEXT,
+  detail     TEXT,
+  ip         TEXT,
+  created_at TIMESTAMPTZ NOT NULL
+);
+CREATE INDEX IF NOT EXISTS audit_created_idx ON app.audit (created_at);

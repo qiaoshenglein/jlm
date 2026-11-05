@@ -247,7 +247,75 @@ try {
   ok('no-horizontal-overflow', p6.overflowX <= 0, `overflowX=${p6.overflowX}`);
   ok('pager-inside-viewport', p6.footBottom <= 900, `footBottom=${p6.footBottom}`);
 
-  // 7) mobile shell: smaller page size, everything on screen
+  // 7) 市场开关：切到美股后，列表、现金池、下单口径要整体跟着换，且不能把版面撑坏
+  const marketGroup = page.getByRole('group', { name: '交易市场与开市状态' });
+  await marketGroup.getByRole('button', { name: /美股/ }).click();
+  await page.waitForFunction(() => localStorage.getItem('mirror.desk.market') === 'us', null, { timeout: 8_000 });
+  await page.waitForTimeout(1_600);
+  const usDesk = await page.evaluate(() => {
+    const chips = [...document.querySelectorAll('[role="group"][aria-label^="交易市场"] button')]
+      .map((button) => `${button.innerText.trim().split('\n')[0]}=${button.getAttribute('aria-pressed')}`);
+    return {
+      chips,
+      header: (document.querySelector('header')?.innerText ?? '').replace(/\n/g, ' | '),
+      rows: document.querySelectorAll('.dense-row:not([aria-hidden])').length,
+      overflowX: document.documentElement.scrollWidth - document.documentElement.clientWidth,
+    };
+  });
+  ok('switch-marks-only-active-market', usDesk.chips.some((chip) => chip.startsWith('美股') && chip.endsWith('true'))
+    && usDesk.chips.some((chip) => chip.startsWith('沪深') && chip.endsWith('false')), usDesk.chips.join(' / '));
+  ok('switch-swaps-cash-pools', usDesk.header.includes('美股可用')
+    && /\$\s?[\d,]+\.\d\d/.test(usDesk.header) && usDesk.header.includes('折合人民币净资产')
+    && usDesk.header.includes('沪深净资产'), usDesk.header.slice(0, 240));
+  await page.getByRole('tab', { name: '指数' }).click();
+  await page.waitForFunction(() => /道琼斯|标普|纳斯达克/.test(document.body.innerText), null, { timeout: 10_000 });
+  const usList = await snap();
+  const usPanelText = await page.evaluate(() => {
+    const panel = document.querySelector('[aria-label="行情分类"]')?.closest('.panel');
+    return (panel?.innerText ?? '').replace(/\n/g, ' ');
+  });
+  ok('switch-follows-through-the-list', /道琼斯|标普/.test(usPanelText) && !usPanelText.includes('上证指数'),
+    usPanelText.slice(0, 90));
+  ok('switch-keeps-pagination-and-width', usList.rows >= 1 && usList.rows <= 10 && usList.overflowX <= 0,
+    `rows=${usList.rows} boxes=${usList.boxes} overflowX=${usList.overflowX}`);
+  await page.getByRole('tab', { name: '个股' }).click();
+  await page.waitForFunction(() => document.querySelectorAll('.dense-row:not([aria-hidden])').length > 0, null, { timeout: 10_000 });
+  await page.locator('.dense-row:not([aria-hidden])').first().click();
+  await page.waitForTimeout(900);
+  const usTicket = await page.evaluate(() => {
+    const panel = [...document.querySelectorAll('.panel')].find((el) => el.innerText.includes('下单'));
+    return (panel?.innerText ?? '').replace(/\n/g, ' | ');
+  });
+  ok('us-ticket-uses-lot-and-fee-wording', usTicket.includes('1 股起') && !usTicket.includes('100 整数倍')
+    && usTicket.includes('无每日涨跌停') && usTicket.includes('T+0'), usTicket.slice(0, 160));
+  const usQtyDefault = await page.locator('#order-qty').inputValue();
+  ok('us-qty-default-shrinks-to-one-lot', Number(usQtyDefault) > 0 && Number(usQtyDefault) <= 100, `qty=${usQtyDefault}`);
+
+  // 规则说明跟着市场走：美股那一页要讲 T+0、无涨跌停与两个现金池
+  await page.getByRole('button', { name: '规则' }).click();
+  await page.waitForFunction(() => document.body.innerText.includes('交易规则与结算口径'), null, { timeout: 5_000 });
+  const rulesText = await page.evaluate(() => document.body.innerText);
+  ok('rules-panel-covers-both-markets', rulesText.includes('两个现金池') && rulesText.includes('常规时段')
+    && rulesText.includes('T+0') && rulesText.includes('无每日涨跌停'),
+    `命中 ${[rulesText.includes('两个现金池'), rulesText.includes('常规时段'), rulesText.includes('T+0')].filter(Boolean).length}/3`);
+  await page.keyboard.press('Escape');
+  await page.waitForTimeout(300);
+
+  await page.keyboard.press('m');
+  await page.waitForFunction(() => localStorage.getItem('mirror.desk.market') === 'cn', null, { timeout: 8_000 });
+  await page.waitForTimeout(1_400);
+  const backToCn = await page.evaluate(() => {
+    const panel = [...document.querySelectorAll('.panel')].find((el) => el.innerText.includes('下单'));
+    return {
+      ticket: (panel?.innerText ?? '').replace(/\n/g, ' | '),
+      header: (document.querySelector('header')?.innerText ?? '').replace(/\n/g, ' | '),
+      overflowX: document.documentElement.scrollWidth - document.documentElement.clientWidth,
+    };
+  });
+  ok('m-key-toggles-back-to-cn', backToCn.ticket.includes('100 整数倍') && backToCn.header.includes('沪深可用')
+    && backToCn.header.includes('美股净资产') && backToCn.overflowX <= 0, backToCn.header.slice(0, 180));
+
+  // 8) mobile shell: smaller page size, everything on screen
   await page.setViewportSize({ width: 390, height: 844 });
   await page.waitForTimeout(600);
   const m = await page.evaluate(() => {

@@ -5,12 +5,14 @@ import { mkdirSync, readFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
+// 补列时要用到默认美元本金：规则层是纯 ESM 无依赖，直接引常量避免两处写死
+import { START_CASH_USD } from '../functions/rules.mjs';
 
 const IDENT = /^[a-z_][a-z0-9_]*$/;
 const HERE = dirname(fileURLToPath(import.meta.url));
 const requireModule = createRequire(import.meta.url);
 
-export const TABLES = ['users', 'sessions', 'orders', 'trades', 'events', 'snapshots'];
+export const TABLES = ['users', 'sessions', 'orders', 'trades', 'events', 'snapshots', 'watchlists', 'settings', 'audit'];
 export const SCHEMA_FILE = { sqlite: 'schema.sqlite.sql', postgres: 'schema.postgres.sql' };
 
 const quote = (name) => {
@@ -60,6 +62,7 @@ class Query {
   lt(key, value) { this.filters.push({ kind: 'lt', key, value }); return this; }
   lte(key, value) { this.filters.push({ kind: 'lte', key, value }); return this; }
   in(key, values) { this.filters.push({ kind: 'in', key, value: [...(values ?? [])] }); return this; }
+  like(key, value) { this.filters.push({ kind: 'like', key, value }); return this; }
 
   order(column, { ascending = true } = {}) { this.orders.push(`${quote(column)} ${ascending ? 'ASC' : 'DESC'}`); return this; }
   limit(n) { this.limitCount = Number(n) | 0; return this; }
@@ -89,6 +92,12 @@ class Query {
         if (!filter.value.length) { parts.push('1 = 0'); continue; }
         const marks = filter.value.map((value) => { this.args.push(this.client.value(value)); return mark(this.args.length); });
         parts.push(`${quote(filter.key)} IN (${marks.join(', ')})`);
+        continue;
+      }
+      if (filter.kind === 'like') {
+        this.args.push(this.client.value(filter.value));
+        // 显式 ESCAPE，让调用方转义过的 % _ \ 按字面匹配，两种方言行为一致
+        parts.push(`${quote(filter.key)} LIKE ${mark(this.args.length)} ESCAPE '\\'`);
         continue;
       }
       this.args.push(this.client.value(filter.value));
@@ -209,7 +218,18 @@ class SqliteClient extends SqlClient {
 
   placeholder() { return '?'; }
 
-  columnPatches() { return ['ALTER TABLE watchlists ADD COLUMN sort INTEGER']; }
+  columnPatches() {
+    return [
+      'ALTER TABLE watchlists ADD COLUMN sort INTEGER',
+      "ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'user'",
+      "ALTER TABLE users ADD COLUMN status TEXT NOT NULL DEFAULT 'active'",
+      'ALTER TABLE users ADD COLUMN start_cash INTEGER',
+      'ALTER TABLE users ADD COLUMN start_cash_usd INTEGER',
+      // 存量账户补一份美元子账户本金（10 万美元），一次性写死：
+      // 之后后台改默认值不会重写这些账户，收益率基准才不会漂移
+      `UPDATE users SET start_cash_usd = ${START_CASH_USD} WHERE start_cash_usd IS NULL`,
+    ];
+  }
 
   async execute(sql, params) {
     return this.db.prepare(sql).all(...params);
@@ -230,7 +250,16 @@ class PgClient extends SqlClient {
 
   placeholder(index) { return `$${index}`; }
 
-  columnPatches() { return ['ALTER TABLE IF NOT EXISTS app.watchlists ADD COLUMN IF NOT EXISTS sort BIGINT']; }
+  columnPatches() {
+    return [
+      'ALTER TABLE IF NOT EXISTS app.watchlists ADD COLUMN IF NOT EXISTS sort BIGINT',
+      "ALTER TABLE IF NOT EXISTS app.users ADD COLUMN IF NOT EXISTS role TEXT NOT NULL DEFAULT 'user'",
+      "ALTER TABLE IF NOT EXISTS app.users ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'active'",
+      'ALTER TABLE IF NOT EXISTS app.users ADD COLUMN IF NOT EXISTS start_cash BIGINT',
+      'ALTER TABLE IF NOT EXISTS app.users ADD COLUMN IF NOT EXISTS start_cash_usd BIGINT',
+      `UPDATE app.users SET start_cash_usd = ${START_CASH_USD} WHERE start_cash_usd IS NULL`,
+    ];
+  }
 
   async execute(sql, params) {
     const result = await this.pool.query(sql, params);

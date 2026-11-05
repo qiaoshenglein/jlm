@@ -52,11 +52,11 @@ export function Auth({ board, session, onSubmit }: {
             <h1 className="text-[3.375rem] font-semibold leading-none tracking-[0.16em] text-foreground sm:text-6xl">镜盘</h1>
             <span className="num text-[0.6875rem] tracking-[0.32em] text-primary">MIRROR DESK</span>
           </div>
-          <p className="mt-3 text-[0.8438rem] leading-[1.5] text-foreground/85">沪深实时行情的两融仿真交易台</p>
+          <p className="mt-3 text-[0.8438rem] leading-[1.5] text-foreground/85">沪深与美股实时行情的两融仿真交易台</p>
           <p className="mt-3 max-w-xl text-[0.8125rem] leading-7 text-muted-foreground">
-            对接沪深实时行情的两融仿真交易台。涨跌幅限制、T+1 交收、佣金印花税过户费、
-            维持担保比例与强制平仓，全部按 A 股真实规则计算。开户即得 100 万虚拟本金，
-            杠杆最高 5 倍，随时可能被强平。
+            一个账户两个子账户：沪深用人民币，美股用美元，随时一键切换。涨跌幅限制、T+1 与 T+0、
+            佣金印花税与 SEC 监管费、维持担保比例与强制平仓，全部按各自市场的真实规则计算。
+            开户即得 100 万元与 10 万美元虚拟本金，杠杆最高 5 倍，随时可能被强平。
           </p>
 
           <div className="mt-7 space-y-2">

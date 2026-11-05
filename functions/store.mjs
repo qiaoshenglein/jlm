@@ -8,7 +8,15 @@ const TABLES = {
   events: 'events',
   snapshots: 'snapshots',
   watchlists: 'watchlists',
+  settings: 'settings',
+  audit: 'audit',
 };
+
+const USER_COLUMNS = 'id,username,display,pass_hash,created_at,last_login,fail_count,locked_until,role,status,start_cash,start_cash_usd';
+const ADMIN_USER_COLUMNS = 'id,username,display,created_at,last_login,fail_count,locked_until,role,status,start_cash,start_cash_usd';
+
+// 后台搜索按字面匹配：转义 LIKE 的通配符，配合 db.mjs 里的 ESCAPE '\'
+const likePattern = (text) => `%${String(text).replace(/[\\%_]/g, (char) => `\\${char}`)}%`;
 
 export class StoreError extends Error {
   constructor(code, status = 503) {
@@ -30,7 +38,7 @@ export class Store {
 
   async getUserByUsername(username) {
     const result = await this.sb.from(TABLES.users)
-      .select('id,username,display,pass_hash,created_at,last_login,fail_count,locked_until')
+      .select(USER_COLUMNS)
       .eq('username', username).limit(1);
     const rows = fail(result, 'read_failed');
     return rows?.[0] ?? null;
@@ -38,13 +46,14 @@ export class Store {
 
   async getUserById(id) {
     const result = await this.sb.from(TABLES.users)
-      .select('id,username,display,pass_hash,created_at,last_login,fail_count,locked_until')
+      .select(USER_COLUMNS)
       .eq('id', id).maybeSingle();
     return fail(result, 'read_failed') ?? null;
   }
 
   async insertUser(row) {
-    const result = await this.sb.from(TABLES.users).insert(row).select('id,username,display,created_at').maybeSingle();
+    const result = await this.sb.from(TABLES.users).insert(row)
+      .select('id,username,display,created_at,role,status,start_cash,start_cash_usd').maybeSingle();
     if (result?.error?.code === '23505') throw new StoreError('username_taken', 409);
     return fail(result, 'write_failed');
   }
@@ -209,8 +218,138 @@ export class Store {
   async listUsernames(ids) {
     if (!ids.length) return new Map();
     const result = await this.sb.from(TABLES.users)
-      .select('id,display,username').in('id', ids).limit(ids.length);
+      .select('id,display,username,start_cash,start_cash_usd').in('id', ids).limit(ids.length);
     const rows = fail(result, 'read_failed') ?? [];
     return new Map(rows.map((row) => [row.id, row]));
+  }
+
+  // ── 后台管理 ────────────────────────────────────────────────
+  // 规模假设：自建部署按「几十到几百账户」设计，单次扫描上限 2000 行，
+  // 超出通过 truncated 明确告知，绝不静默截断统计数字。
+  // 后台路径一律不 select pass_hash，避免口令哈希进入可被日志/响应带出的代码路径。
+  async scanUsers() {
+    const result = await this.sb.from(TABLES.users)
+      .select(ADMIN_USER_COLUMNS).order('created_at', { ascending: false }).limit(2000);
+    return fail(result, 'read_failed') ?? [];
+  }
+
+  async getUserRow(id) {
+    const result = await this.sb.from(TABLES.users).select(ADMIN_USER_COLUMNS).eq('id', id).maybeSingle();
+    return fail(result, 'read_failed') ?? null;
+  }
+
+  // 构造器没有 or，用户名与昵称分两次查再在 JS 里合并（账户量级小，代价可忽略）
+  async searchUsers(query) {
+    const pattern = likePattern(query);
+    const byName = await this.sb.from(TABLES.users).select(ADMIN_USER_COLUMNS).like('username', pattern).limit(200);
+    const byDisplay = await this.sb.from(TABLES.users).select(ADMIN_USER_COLUMNS).like('display', pattern).limit(200);
+    const merged = new Map();
+    for (const row of [...(fail(byName, 'read_failed') ?? []), ...(fail(byDisplay, 'read_failed') ?? [])]) merged.set(row.id, row);
+    return [...merged.values()].sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)));
+  }
+
+  async setUserRole(id, role) {
+    const result = await this.sb.from(TABLES.users).update({ role }).eq('id', id).select('id').maybeSingle();
+    return Boolean(result?.data?.id);
+  }
+
+  async setUserStatus(id, status) {
+    const result = await this.sb.from(TABLES.users).update({ status }).eq('id', id).select('id').maybeSingle();
+    return Boolean(result?.data?.id);
+  }
+
+  async clearLoginLock(id) {
+    const result = await this.sb.from(TABLES.users)
+      .update({ fail_count: 0, locked_until: null }).eq('id', id).select('id').maybeSingle();
+    return Boolean(result?.data?.id);
+  }
+
+  async countAdmins() {
+    const result = await this.sb.from(TABLES.users).select('id').eq('role', 'admin').limit(200);
+    return (fail(result, 'read_failed') ?? []).length;
+  }
+
+  async dropUserSessions(userId) {
+    const result = await this.sb.from(TABLES.sessions).delete().eq('user_id', userId).select('token');
+    return (fail(result, 'read_failed') ?? []).length;
+  }
+
+  async lockedUsers(nowIso) {
+    const result = await this.sb.from(TABLES.users).select('id').gt('locked_until', nowIso).limit(500);
+    return (fail(result, 'read_failed') ?? []).length;
+  }
+
+  async dayStats(day) {
+    const orderResult = await this.sb.from(TABLES.orders).select('id,status,reason').eq('day', day).limit(2000);
+    const tradeResult = await this.sb.from(TABLES.trades).select('id,fee,amount').eq('day', day).limit(2000);
+    const orders = fail(orderResult, 'read_failed') ?? [];
+    const trades = fail(tradeResult, 'read_failed') ?? [];
+    const count = (status) => orders.filter((row) => row.status === status).length;
+    const reasons = {};
+    for (const row of orders) {
+      if (row.status !== 'rejected' || !row.reason) continue;
+      reasons[row.reason] = (reasons[row.reason] ?? 0) + 1;
+    }
+    return {
+      orders: orders.length,
+      filled: count('filled'),
+      rejected: count('rejected'),
+      canceled: count('canceled'),
+      live: orders.filter((row) => row.status === 'open' || row.status === 'filling').length,
+      trades: trades.length,
+      fees: trades.reduce((sum, row) => sum + Number(row.fee ?? 0), 0),
+      turnover: trades.reduce((sum, row) => sum + Number(row.amount ?? 0), 0),
+      reasons,
+      truncated: orders.length >= 2000 || trades.length >= 2000,
+    };
+  }
+
+  async listOrdersAdmin({ userId = null, day = null, status = null, limit = 50, offset = 0 } = {}) {
+    let query = this.sb.from(TABLES.orders)
+      .select('id,user_id,secid,code,name,kind,side,mode,qty,limit_price,leaf,status,day,reason,source,created_at,updated_at');
+    if (userId) query = query.eq('user_id', userId);
+    if (day) query = query.eq('day', day);
+    if (status) query = query.eq('status', status);
+    const result = await query.order('created_at', { ascending: false }).limit(limit).range(offset, offset + limit - 1);
+    return fail(result, 'read_failed') ?? [];
+  }
+
+  async eventsSince(iso, limit = 200) {
+    const result = await this.sb.from(TABLES.events)
+      .select('id,user_id,kind,message,created_at').gte('created_at', iso)
+      .order('created_at', { ascending: false }).limit(limit);
+    return fail(result, 'read_failed') ?? [];
+  }
+
+  async snapshotsForDay(day) {
+    const result = await this.sb.from(TABLES.snapshots)
+      .select('user_id,day,net_assets,total_assets,cash,total_debt,updated_at').eq('day', day).limit(2000);
+    const rows = fail(result, 'read_failed') ?? [];
+    return new Map(rows.map((row) => [row.user_id, row]));
+  }
+
+  async getSettings() {
+    const result = await this.sb.from(TABLES.settings).select('key,value,updated_by,updated_at').limit(200);
+    return fail(result, 'read_failed') ?? [];
+  }
+
+  async setSetting(key, value, by, at) {
+    const result = await this.sb.from(TABLES.settings)
+      .upsert({ key, value, updated_by: by, updated_at: at }, { onConflict: 'key' })
+      .select('key').maybeSingle();
+    return fail(result, 'write_failed');
+  }
+
+  async insertAudit(row) {
+    const result = await this.sb.from(TABLES.audit)
+      .insert(row).select('id').maybeSingle();
+    return fail(result, 'write_failed');
+  }
+
+  async listAudit(limit = 60, offset = 0) {
+    const result = await this.sb.from(TABLES.audit)
+      .select('id,actor_id,actor,action,target,detail,created_at')
+      .order('created_at', { ascending: false }).limit(limit).range(offset, offset + limit - 1);
+    return fail(result, 'read_failed') ?? [];
   }
 }

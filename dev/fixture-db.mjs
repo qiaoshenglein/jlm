@@ -13,12 +13,18 @@ const UNIQUE = {
   events: [['user_id', 'dedup']],
   snapshots: [['user_id', 'day']],
   watchlists: [['user_id', 'secid']],
+  settings: [['key']],
+  audit: [],
 };
 const PRIMARY = {
-  users: 'id', sessions: 'token', orders: 'id', trades: 'id', events: 'id', snapshots: 'id', watchlists: 'id',
+  users: 'id', sessions: 'token', orders: 'id', trades: 'id', events: 'id', snapshots: 'id',
+  watchlists: 'id', settings: 'key', audit: 'id',
 };
 
 const clone = (value) => JSON.parse(JSON.stringify(value));
+
+// 与 schema 里的 DEFAULT 对齐：调用方没写权限列时也要拿到值，否则后台测试会对着 undefined 断言
+const COLUMN_DEFAULTS = { users: { role: 'user', status: 'active' } };
 
 export function createFixtureDb({ persist = true } = {}) {
   const tables = new Map(Object.keys(UNIQUE).map((name) => [name, []]));
@@ -80,10 +86,17 @@ class Builder {
   eq(key, value) { this.filters.push((row) => String(row[key]) === String(value)); return this; }
   neq(key, value) { this.filters.push((row) => String(row[key]) !== String(value)); return this; }
   in(key, values) { const set = new Set(values.map(String)); this.filters.push((row) => set.has(String(row[key]))); return this; }
-  gt(key, value) { this.filters.push((row) => String(row[key]) > String(value)); return this; }
-  gte(key, value) { this.filters.push((row) => row[key] >= value); return this; }
-  lt(key, value) { this.filters.push((row) => String(row[key]) < String(value)); return this; }
-  lte(key, value) { this.filters.push((row) => row[key] <= value); return this; }
+  // 比较类过滤与 SQL 对齐：列值为 NULL 时结果是 UNKNOWN，不匹配
+  gte(key, value) { this.filters.push((row) => row[key] != null && row[key] >= value); return this; }
+  lt(key, value) { this.filters.push((row) => row[key] != null && String(row[key]) < String(value)); return this; }
+  lte(key, value) { this.filters.push((row) => row[key] != null && row[key] <= value); return this; }
+  gt(key, value) { this.filters.push((row) => row[key] != null && String(row[key]) > String(value)); return this; }
+  // 与 db.mjs 的 LIKE 对齐：store 只会传「%转义后的字面串%」，这里按子串包含处理
+  like(key, value) {
+    const text = String(value ?? '').replace(/%/g, '').replace(/\\([%_\\])/g, '$1');
+    this.filters.push((row) => String(row[key] ?? '').includes(text));
+    return this;
+  }
   order(column, { ascending = true } = {}) { this.orders.push({ column, ascending }); return this; }
   limit(n) { this.count = n; return this; }
   range(from, to) { this.from = from; this.to = to; return this; }
@@ -121,7 +134,8 @@ class Builder {
       return { data: this.emit(this.matches()), error: null };
     }
     if (this.op === 'insert') {
-      const rows = Array.isArray(this.payload) ? this.payload : [this.payload];
+      const input = Array.isArray(this.payload) ? this.payload : [this.payload];
+      const rows = input.map((row) => ({ ...(COLUMN_DEFAULTS[this.name] ?? {}), ...row }));
       for (const row of rows) {
         const error = this.conflict(this.name, row);
         if (error) return { data: null, error };

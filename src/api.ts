@@ -1,5 +1,7 @@
 // 与同源 Function 通信的唯一入口：只走 POST + JSON，令牌随请求体发送。
 // 站点网关会剥离 cookie 与 authorization，因此不能依赖它们承载应用会话。
+import type { Market } from './format';
+
 export class ApiError extends Error {
   constructor(message: string, readonly code: string, readonly status = 0) {
     super(message);
@@ -64,6 +66,23 @@ export function writeToken(token: string | null) {
 
 type Payload = Record<string, unknown>;
 
+// 当前市场是「一次切换、全站跟随」的上下文：让它走请求体，
+// 调用点就不必在每个 action 上重复传 market，也不会漏传成另一个池子
+const MARKET_KEY = 'mirror.desk.market';
+let activeMarket: Market = readMarket();
+export function readMarket(): Market {
+  try {
+    return localStorage.getItem(MARKET_KEY) === 'us' ? 'us' : 'cn';
+  } catch {
+    return 'cn';
+  }
+}
+export function setMarket(market: Market) {
+  activeMarket = market;
+  try { localStorage.setItem(MARKET_KEY, market); } catch { /* 隐私模式下仅本次生效 */ }
+}
+export const currentMarket = () => activeMarket;
+
 export async function api<T>(action: string, payload: Payload = {}, quiet = false): Promise<T> {
   const token = readToken();
   const headers = new Headers({ 'Content-Type': 'application/json', Accept: 'application/json' });
@@ -73,7 +92,9 @@ export async function api<T>(action: string, payload: Payload = {}, quiet = fals
       method: 'POST',
       headers,
       credentials: 'same-origin',
-      body: JSON.stringify(token ? { ...payload, token } : payload),
+      body: JSON.stringify(token
+        ? { market: activeMarket, ...payload, token }
+        : { market: activeMarket, ...payload }),
     });
   } catch {
     if (!quiet) throw new ApiError(MESSAGES.network_error, 'network_error');

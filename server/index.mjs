@@ -7,6 +7,8 @@ import { dirname, extname, normalize, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createDb } from './db.mjs';
 import { handle } from '../functions/api.mjs';
+import { Store } from '../functions/store.mjs';
+import { adminNames, ensureAdmins } from '../functions/admin.mjs';
 
 // 命令行参数优先于环境变量：Windows 的 cmd / PowerShell 里 `PORT=8791 node ...` 那种写法不生效。
 // 同名参数取最后一个，方便 `npm run serve -- --port 8899` 覆盖脚本里的默认端口
@@ -64,6 +66,9 @@ if (process.env.DB_AUTO_MIGRATE !== '0') {
 }
 
 const log = (line) => console.log(new Date().toISOString(), line);
+
+// 后台引导：ADMIN_USERNAMES 里已注册的账户立刻标为 admin；还没注册的，等其注册后由首次后台请求补上
+const adminBoot = await ensureAdmins(new Store(db));
 
 function send(res, status, body, headers = {}) {
   res.writeHead(status, { ...SECURITY_HEADERS, ...headers });
@@ -167,6 +172,9 @@ server.listen(PORT, HOST, async () => {
   const hasWeb = Boolean(await stat(WEB_DIR).catch(() => null));
   log(`镜盘已启动：${listenUrls().join('  ')} 数据驱动=${db.driver}${migrated ? ` 已应用 ${migrated}` : ' 跳过建表'}`);
   log(`静态目录 ${WEB_DIR}${hasWeb ? '' : ' —— 不存在，请先执行 npm run build'}`);
+  log(adminBoot.configured
+    ? `后台已启用：管理员 ${adminNames().join('、')}${adminBoot.justGranted.length ? `（本次新授予 ${adminBoot.justGranted.join('、')}）` : ''} · 入口 #/admin`
+    : '后台未启用：设置环境变量 ADMIN_USERNAMES=你的用户名 后再启动即可开启');
 });
 
 const shutdown = (signal) => {
