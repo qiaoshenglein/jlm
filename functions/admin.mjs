@@ -3,11 +3,12 @@
 import { MICRO, START_CASH, START_CASH_USD, clampText, etParts, inRange, normalizeLines, setParams, startBaseOf } from './rules.mjs';
 import { DEFAULT_PARAMS, DEFAULT_PARAMS_US, activeParams } from './rules.mjs';
 import {
-  QUOTE_HOSTS, QUOTE_PROBES, QUOTE_SOURCE_DEFAULTS, checkQuoteSource, getFx, getQuotes, getUsQuotes,
-  probeQuoteSource, quoteHealth, quoteSource, setQuoteSource,
+  QUOTE_HOSTS, QUOTE_PROBES, QUOTE_SOURCE_DEFAULTS, US_INDEXES, checkQuoteSource, fxSource, getFx, getQuotes, getUsQuotes,
+  probeQuoteSource, quoteHealth, quoteProviders, quoteSource, setQuoteSource,
 } from './quotes.mjs';
 import { replay, startCashOf, tradesOf } from './ledger.mjs';
 import { newId } from './auth.mjs';
+import { applyBackup, exportBackup, inspectBackup, planBackup } from './backup.mjs';
 
 // 只允许「改了只影响未来」的键。开户本金的历史账户值冻结在 users.start_cash / start_cash_usd 里，
 // 这里改的是「新账户默认值」，不会重写任何已存在的账本；已落库的成交与费用永不重算。
@@ -33,6 +34,10 @@ const JSON_KEYS = { params: 'cn', us_params: 'us', quote_source: 'source' };
 const DEFAULTS_OF = { cn: DEFAULT_PARAMS, us: DEFAULT_PARAMS_US };
 const MAX_GRANT_MICRO = 1_000_000_000 * MICRO; // 单笔调整上限 10 亿（虚拟资金，防误操作）
 const CHECKS_PER_MINUTE = 12;
+// 备份：导出与预检各扫全库，导入更是整库重写——限频单独一档，且导入前必须先落快照
+const BACKUP_PER_MINUTE = 8;
+const BACKUP_APPLY_PER_MINUTE = 3;
+const BACKUP_SCOPES = { data: true, config: true, audit: true, sessions: false };
 
 // 分组深合并，缺项回落默认值：后台只改一条线时不会把其它线清空
 function mergeParams(base, patch, market = 'cn') {
@@ -175,14 +180,24 @@ let lastQuoteCheck = null;
 const pickHealth = (item) => ({
   ok: item.ok, fresh: item.fresh, rows: item.rows, note: item.note, partial: item.partial,
   dataAgeMinutes: item.dataAgeMinutes, staleWarn: item.staleWarn,
+  sourceLabel: item.sourceLabel, fellBack: item.fellBack,
 });
+
+// 导出范围只认这四个开关，其它键名一律忽略（前端加字段不会意外多导表）
+const pickScopes = (raw) => {
+  const out = { ...BACKUP_SCOPES };
+  for (const key of Object.keys(BACKUP_SCOPES)) {
+    if (raw?.[key] !== undefined) out[key] = raw[key] === true;
+  }
+  return out;
+};
 
 function dayStartMs(today) {
   // today 形如 2026-11-04（北京日期）→ 该日 00:00 北京时间的 UTC 毫秒
   return Date.parse(`${today}T00:00:00+08:00`);
 }
 
-export async function runAdmin({ store, action, admin, body, nowMs, today, ip }) {
+export async function runAdmin({ store, action, admin, body, nowMs, today, ip, files = null }) {
   const stamp = new Date(nowMs).toISOString();
 
   if (action === 'admin_overview') {
@@ -449,9 +464,11 @@ export async function runAdmin({ store, action, admin, body, nowMs, today, ip })
       source: quoteSource(),
       defaults: QUOTE_SOURCE_DEFAULTS,
       hosts: QUOTE_HOSTS,
-      probes: QUOTE_PROBES.map(({ key, label, note }) => ({ key, label, note })),
+      providers: quoteProviders(),
+      probes: QUOTE_PROBES.map(({ key, label, note, provider, providerLabel, cap }) => ({ key, label, note, provider, providerLabel, cap })),
       health: { cn: quoteHealth('cn', now), us: quoteHealth('us', now) },
       fx: await getFx(now).catch(() => 0),
+      fxSource: fxSource(),
       settings: { match_paused: settings.match_paused, match_paused_us: settings.match_paused_us },
       // 上一次检测的结果留在进程里：概览页要显示结论，但不该为此再打一次上游
       lastCheck: lastQuoteCheck,
@@ -459,26 +476,59 @@ export async function runAdmin({ store, action, admin, body, nowMs, today, ip })
   }
 
   if (action === 'admin_quote_check') {
-    // 一次检测 = 八个端点各打一次 + 两个市场的池子重建，所以单独限频且顺序执行，不并发
+    // 一次检测 = 每家源的每项能力各打一次 + 两个市场的池子重建。
+    // 各家并行、家内串行：坏主机通常是秒级拒连而不是超时，并行才不会把按钮按成转圈
     if (throttledHere(`quote:${admin.id}`, CHECKS_PER_MINUTE, 60_000, nowMs)) throw fail('too_many_requests', 429);
     const now = new Date(nowMs);
-    const results = [];
-    for (const item of QUOTE_PROBES) results.push(await probeQuoteSource(item.key, now));
+    const lanes = QUOTE_PROBES.reduce((out, item) => {
+      (out[item.provider] ??= []).push(item);
+      return out;
+    }, {});
+    const results = (await Promise.all(Object.values(lanes).map(async (lane) => {
+      const rows = [];
+      for (const item of lane) rows.push(await probeQuoteSource(item.key, now));
+      return rows;
+    }))).flat();
     // 探测单条通了不代表池子能建起来：再按线上路径强制重建一次，健康度才是真话
     await Promise.allSettled([getQuotes(true, now), getUsQuotes(true, now)]);
     const health = { cn: quoteHealth('cn', now), us: quoteHealth('us', now) };
+    const byCap = results.reduce((out, row) => {
+      (out[row.cap] ??= []).push(row);
+      return out;
+    }, {});
+    const coverage = Object.entries(byCap).map(([cap, rows]) => ({
+      cap,
+      label: rows[0]?.label ?? cap,
+      ok: rows.some((row) => row.ok),
+      providers: rows.filter((row) => row.ok).map((row) => row.providerLabel),
+      failures: rows.filter((row) => !row.ok).map((row) => `${row.providerLabel}:${row.error}`),
+    }));
+    const dead = coverage.filter((item) => !item.ok);
+    const verdict = !coverage.some((item) => item.ok) ? 'down'
+      : dead.length ? 'partial' : 'ok';
     const okCount = results.filter((row) => row.ok).length;
-    const verdict = okCount === results.length ? 'ok' : okCount === 0 ? 'down' : 'partial';
     const advice = [];
-    const failed = (key) => results.find((row) => row.key === key && !row.ok);
-    if (failed('cn_board')) advice.push('沪深板块池取不到：A 股列表与撮合会退到上一次快照，当日判定不通过时自动停撮合。');
-    if (failed('us_board')) advice.push('美股板块池取不到：美股列表与撮合退到上一次快照。');
-    if (failed('single')) advice.push('单标的接口不可用：行情池外的标的（自选补价、按代码直查）取不到新价，池内标的不受影响。');
-    if (failed('trends') || failed('kline')) advice.push('历史接口不可用：分时与日 K 显示「暂时取不到」，撮合与账本不受影响。');
-    if (failed('suggest')) advice.push('检索接口不可用：搜索只能命中行情池内已有标的。');
-    if (failed('fx')) advice.push('汇率取不到：合并口径沿用上次值或兜底 6.7，只影响展示，不影响记账。');
-    const usIndexRow = results.find((row) => row.key === 'us_index');
-    if (usIndexRow?.ok && (usIndexRow.rows ?? 0) < 4) advice.push(`美股指数只有 ${usIndexRow.rows}/4 条：板块池仍可用，指数条会缺项。`);
+    const capDown = (cap) => dead.some((item) => item.cap === cap);
+    const active = health.cn.sourceLabel || health.us.sourceLabel;
+    if (health.cn.fellBack || health.us.fellBack) {
+      advice.push(`已降级到 ${active ?? '备用源'}：东方财富本轮取不到，撮合与列表改用备用源的数据（字段口径已逐项实测核对）。`);
+    }
+    if (capDown('cnStocks')) advice.push('所有源的沪深池都取不到：A 股列表与撮合退到上一次快照，当日判定不通过时自动停撮合。');
+    if (capDown('usStocks')) advice.push('所有源的美股池都取不到：美股退到上一次快照；降级时美股按持仓与自选逐个补价，没有持仓就只剩指数。');
+    if (capDown('cnIndexes')) advice.push('指数全挂：顶部指数条为空，撮合不受影响。');
+    if (capDown('one')) advice.push('单标的补价全挂：行情池外的标的（自选补价、按代码直查）取不到新价。');
+    if (capDown('kline')) advice.push('日 K 全挂：蜡烛图显示「暂时取不到」，撮合与账本不受影响。');
+    if (capDown('trends')) advice.push('分时全挂：分时图显示「暂时取不到」，撮合与账本不受影响。');
+    if (capDown('suggest')) advice.push('检索全挂：搜索只能命中行情池内已有标的。');
+    if (capDown('fx')) advice.push('汇率全挂：合并口径沿用上次值或兜底 6.7，只影响展示，不影响记账。');
+    if (!capDown('fx') && byCap.fx.some((row) => row.ok && row.provider !== 'eastmoney')) {
+      advice.push('汇率走了备用源：腾讯没有在岸/离岸之分的 USDCNH，用在岸 USDCNY 代替，只差几个基点，且只影响展示。');
+    }
+    const usIndexRows = byCap.usIndexes ?? [];
+    const bestUsIndex = Math.max(0, ...usIndexRows.filter((row) => row.ok).map((row) => row.rows ?? 0));
+    if (bestUsIndex > 0 && bestUsIndex < US_INDEXES.length) {
+      advice.push(`美股指数最多只有 ${bestUsIndex}/${US_INDEXES.length} 条：板块池仍可用，指数条会缺项。`);
+    }
     for (const item of [health.cn, health.us]) {
       if (!item.fresh) advice.push(`${MARKET_LABEL[item.market]}行情时间戳不在当日：本轮不撮合（休市、节假日或上游延迟），系统时间 ${item.today}，数据日 ${item.day || '空'}。`);
       else if (item.staleWarn) advice.push(`${MARKET_LABEL[item.market]}数据已落后 ${item.dataAgeMinutes} 分钟，超过告警阈值。`);
@@ -487,8 +537,89 @@ export async function runAdmin({ store, action, admin, body, nowMs, today, ip })
     lastQuoteCheck = {
       at: stamp, verdict, okCount, total: results.length,
       slowest: results.reduce((max, row) => (row.ms > (max?.ms ?? -1) ? row : max), null)?.ms ?? 0,
+      activeSource: active ?? null,
     };
-    return { results, verdict, okCount, total: results.length, health, advice, source: quoteSource(), checkedAt: stamp };
+    return {
+      results, verdict, okCount, total: results.length, coverage, dead: dead.map((item) => item.cap),
+      health, advice, source: quoteSource(), providers: quoteProviders(), checkedAt: stamp,
+    };
+  }
+
+  if (action === 'admin_backup_export') {
+    if (throttledHere(`backup:${admin.id}`, BACKUP_PER_MINUTE, 60_000, nowMs)) throw fail('too_many_requests', 429);
+    const document = await exportBackup(store.sb, {
+      include: pickScopes(body.include), now: new Date(nowMs),
+      meta: { driver: store.sb.driver ?? null, schema: store.sb.schema ?? null, by: admin.username },
+    });
+    // 审计里只落「谁在什么时候导出了多少行、校验和是什么」，绝不落内容
+    await writeAudit(store, {
+      admin, action: 'admin_backup_export', target: `${document.rows} 行`,
+      detail: { scopes: document.meta.scopes, counts: document.counts, checksum: document.checksum, bytes: document.bytes },
+      ip, nowMs,
+    });
+    return { document, bytes: document.bytes, checksum: document.checksum, counts: document.counts, rows: document.rows };
+  }
+
+  if (action === 'admin_backup_preview') {
+    if (throttledHere(`backup:pre:${admin.id}`, BACKUP_PER_MINUTE, 60_000, nowMs)) throw fail('too_many_requests', 429);
+    const report = await inspectBackup(body.document);
+    if (!report.ok) throw fail('backup_invalid', 400, { problems: report.problems });
+    const plans = {};
+    for (const mode of ['replace', 'config']) {
+      if (report.modes[mode]) plans[mode] = await planBackup(store.sb, report, mode);
+    }
+    const admins = (report.tables.users ?? []).filter((row) => row.role === 'admin').length;
+    const warnings = [...report.warnings];
+    if (report.tables.users && !admins) {
+      warnings.push('文件里没有任何 role=admin 的账户：导入后后台入口会关闭，直到重启时按 ADMIN_USERNAMES 重新授予。');
+    }
+    return {
+      rows: report.rows, counts: report.counts, checksum: report.checksum, warnings, modes: report.modes,
+      created_at: report.created_at, meta: report.meta, admins, plans,
+    };
+  }
+
+  if (action === 'admin_backup_apply') {
+    if (body.confirm !== true) throw fail('confirm_required', 400);
+    // 模式必须显式给出：缺省或拼错都不能默认成「覆盖全站」这种破坏性最强的一档
+    const mode = body.mode === 'config' || body.mode === 'replace' ? body.mode : null;
+    if (!mode) throw fail('backup_mode_unavailable', 400, { mode: body.mode ?? null });
+    if (typeof store.sb.withTx !== 'function') throw fail('backup_runtime_unsupported', 503);
+    const report = await inspectBackup(body.document);
+    if (!report.ok) throw fail('backup_invalid', 400, { problems: report.problems });
+    if (!report.modes[mode]) throw fail('backup_mode_unavailable', 400, { mode });
+    // 打字确认：要输入服务端刚算出的校验和前 6 位，等于「我看过这份预检结果了」
+    const expect = String(report.checksum ?? '').slice(0, 6);
+    if (String(body.ack ?? '').trim().toLowerCase() !== expect) throw fail('backup_ack_mismatch', 400, { expect });
+    // 限频卡在校验之后、写盘之前：被拒的请求不该占用配额，但真正动库的必须计数
+    if (throttledHere(`backup:apply:${admin.id}`, BACKUP_APPLY_PER_MINUTE, 60_000, nowMs)) throw fail('too_many_requests', 429);
+
+    // 先落导入前快照，落不下去就不做覆盖——没有退路的写操作不执行。
+    // 快照比常规导出多带一份会话摘要：真要回滚时，连「谁还登录着」都一起还原。
+    let snapshot = null;
+    try {
+      const current = await exportBackup(store.sb, {
+        include: { sessions: true }, now: new Date(nowMs), meta: { by: admin.username, reason: 'pre-import' },
+      });
+      snapshot = await files?.save?.(JSON.stringify(current));
+    } catch { snapshot = null; }
+    if (!snapshot) throw fail('backup_snapshot_failed', 503);
+
+    const result = await applyBackup(store.sb, report, { mode, now: new Date(nowMs), actor: admin.username });
+    invalidateSettings();
+    await readSettingsCached(store, 0); // 新配置立即驱动撮合参数与行情源，不用重启
+    // 导入可能把管理员角色一起覆盖掉；按 ADMIN_USERNAMES 立刻补授，否则操作者会被关在门外
+    granted.clear();
+    const regranted = (await ensureAdmins(store)).justGranted;
+    await writeAudit(store, {
+      admin, action: 'admin_backup_apply', target: `${mode} · ${report.rows} 行`,
+      detail: {
+        mode, checksum: report.checksum, applied: result.applied, cleared: result.cleared,
+        snapshot: snapshot.path, took_ms: result.took_ms, reauth_required: result.reauth_required,
+      },
+      ip, nowMs,
+    });
+    return { ...result, snapshot, regranted };
   }
 
   if (action === 'admin_audit') {

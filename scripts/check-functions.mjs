@@ -6,7 +6,8 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
-const files = ['functions', 'dev'].flatMap((dir) => readdirSync(join(root, dir))
+// server/ 与 scripts/ 同样是运行时执行的代码，纳入同一道语法闸门
+const files = ['functions', 'server', 'scripts', 'dev'].flatMap((dir) => readdirSync(join(root, dir))
   .filter((name) => /\.(mjs|js)$/.test(name))
   .map((name) => join(root, dir, name)));
 

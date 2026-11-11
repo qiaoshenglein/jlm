@@ -90,7 +90,8 @@ export type Board = {
   // 美股没有涨跌家数接口，取不到就是 null，前端隐藏这一条而不是编一个 0
   breadth: { up: number; down: number; flat: number; limitUp: number; limitDown: number } | null;
   // partial：上游只挂掉一部分时的降级说明（例如 ETF 补取失败），池子仍然可用
-  status: { ok: boolean; note: string | null; partial?: string };
+  // source/fellBack：现在用的是哪家行情源，以及它是不是降级来的（首选源挂了才换）
+  status: { ok: boolean; note: string | null; partial?: string; source?: string | null; sourceKey?: string | null; fellBack?: boolean };
 };
 
 export type Clock = { day: string; hour: number; minute: number; second: number; weekend: boolean; stamp: string };

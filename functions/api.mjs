@@ -6,7 +6,7 @@ import {
 } from './rules.mjs';
 import {
   KEY_INDEXES, US_INDEXES, ensureQuote, getFx, klineOf, quoteStatus, quoteStatusFor, quotesFor,
-  searchSymbols, trendsOf,
+  searchSymbols, secidByCode, trendsOf,
 } from './quotes.mjs';
 import { Store } from './store.mjs';
 import { MAX_QTY, REASONS, REASONS_US, judgeOrder, planLiquidation, reasonText, validateOrder } from './engine.mjs';
@@ -49,12 +49,24 @@ const API_MESSAGES = {
   key_management_requires_session: '密钥的生成与撤销只能用网页登录后的会话令牌，不能用 API 密钥本身。',
   key_limit: '每个账户最多保留 10 把有效密钥。',
   name_invalid: '密钥备注名过长或含非法字符。',
+  backup_invalid: '备份文件未通过校验，未做任何改动。',
+  backup_mode_unavailable: '这份文件不支持该导入方式（缺少对应的表）。',
+  backup_ack_mismatch: '校验和输入不一致：请填写预检结果里那 6 位字符。',
+  backup_runtime_unsupported: '当前运行时没有事务能力，导入只在自建部署（SQLite / PostgreSQL）开放；导出与命令行仍可用。',
+  backup_snapshot_failed: '导入前快照写盘失败，已停止操作——没有退路就不覆盖整库。',
+  confirm_required: '该操作会改动整库或影响全站，需要显式确认。',
+  payload_too_large: '请求体超出上限，整库恢复请改用命令行脚本。',
 };
 
 // 校验类失败可以带附加字段（比如行情源哪几项不合法），让后台能把原话显示出来而不是只说「参数错误」
 const bad = (code, status = 400, extra = null) => {
   const base = API_MESSAGES[code] ?? REASONS[code] ?? '请求未成功，请检查参数与当前状态。';
-  const detail = Array.isArray(extra?.rejected) && extra.rejected.length ? `${base}（${extra.rejected.join('；')}）` : base;
+  // 逐项原因有两种来源：参数校验的 rejected 文本，与备份预检的 problems 结构
+  const list = Array.isArray(extra?.rejected) ? extra.rejected.map(String)
+    : Array.isArray(extra?.problems) ? extra.problems.map((item) => item?.message ?? String(item)) : [];
+  const detail = list.length
+    ? `${base}（${list.slice(0, 3).join('；')}${list.length > 3 ? ` 等 ${list.length} 处` : ''}）`
+    : base;
   return json({ ok: false, code, message: detail, ...(extra && typeof extra === 'object' ? extra : {}) }, status);
 };
 
@@ -64,7 +76,9 @@ const READ_ACTIONS = new Set(['board', 'sync', 'me', 'chart', 'leader', 'rules',
   'admin_quote_status', 'admin_quote_check']);
 const WRITE_ACTIONS = new Set(['register', 'login', 'logout', 'order', 'cancel', 'preview', 'watch_add', 'watch_remove', 'watch_sort',
   'key_create', 'key_revoke',
-  'admin_freeze', 'admin_unfreeze', 'admin_unlock', 'admin_revoke_sessions', 'admin_role', 'admin_grant_cash']);
+  'admin_freeze', 'admin_unfreeze', 'admin_unlock', 'admin_revoke_sessions', 'admin_role', 'admin_grant_cash',
+  // 备份三个动作都要写库（导出也写审计），因此按写操作对待：GET 一律拒绝
+  'admin_backup_export', 'admin_backup_preview', 'admin_backup_apply']);
 
 // 公开 REST 层：路径 + 方法 → 内部 action。只在这一层做「对外友好名」到内部字段的翻译，
 // 撮合、风控、账本仍然只有一份实现，不存在两套口径。
@@ -159,9 +173,10 @@ async function resolveSecid(input, now = new Date()) {
   if (CN_CODE.test(text)) return /^[569]/.test(text) ? `1.${text}` : `0.${text}`;
   if (US_CODE.test(text)) {
     const upper = text.toUpperCase();
-    // 同一份代码可能挂在不同交易所，交给检索接口定位，不猜
+    // 同一份代码可能挂在不同交易所，交给检索接口定位，不猜；
+    // 检索不可用时（源降级）退回「已加载的池子 + 记过的代码」，至少直查持仓里的美股不会瞎
     const rows = await searchSymbols(upper, new Map(), now, 'us').catch(() => []);
-    return rows.find((row) => String(row.code).toUpperCase() === upper)?.secid ?? null;
+    return rows.find((row) => String(row.code).toUpperCase() === upper)?.secid ?? secidByCode(upper, 'us');
   }
   return null;
 }
@@ -228,6 +243,12 @@ async function readBody(request, limit = 4096) {
   }
 }
 
+// 备份的两个动作要把整库 JSON 发上来，请求体上限单独一档；
+// 自建入口（server/index.mjs）用同一个 BACKUP_MAX_MB 在外层再挡一次，两边口径一致。
+const BACKUP_ACTIONS = new Set(['admin_backup_preview', 'admin_backup_apply']);
+const MAX_BACKUP_BODY = (Number(globalThis.process?.env?.BACKUP_MAX_MB ?? 0) > 0
+  ? Number(globalThis.process.env.BACKUP_MAX_MB) : 24) * 1024 * 1024;
+
 export function publicMarket(quotes, market = 'cn') {
   const list = [...quotes.values()];
   if (market === 'us') {
@@ -287,12 +308,22 @@ const RULES = (settings = null, market = 'cn') => ({
   labels: SIDE_LABELS,
 });
 
-export async function handle({ request, supabase }) {
+export async function handle({ request, supabase, files = null }) {
   const store = new Store(supabase);
   const url = new URL(request.url);
   const method = request.method.toUpperCase();
-  const raw = method === 'GET' || method === 'HEAD' ? {} : await readBody(request);
-  if (raw === null) return bad('body_invalid');
+  const preAction = url.searchParams.get('action') ?? '';
+  const limit = BACKUP_ACTIONS.has(preAction) ? MAX_BACKUP_BODY : undefined;
+  const raw = method === 'GET' || method === 'HEAD' ? {} : await readBody(request, limit);
+  if (raw === null) {
+    if (limit !== undefined) {
+      return bad('payload_too_large', 413, {
+        limit_mb: Math.round(limit / 1024 / 1024),
+        hint: '整库恢复请改用命令行：node scripts/backup.mjs import <文件>',
+      });
+    }
+    return bad('body_invalid');
+  }
   // /api/v1/* 是对外 REST 入口：把友好字段翻成内部 action + payload，其余逻辑与网页端共用一份
   const rest = url.pathname.startsWith('/api/');
   let action = url.searchParams.get('action') ?? 'board';
@@ -326,6 +357,8 @@ export async function handle({ request, supabase }) {
         // 否则管理员把交易台停在美股页时，账户页会按美东日去找快照，整列净资产都空掉
         today: clock.day,
         ip: forwarded || (request.headers.get('cf-connecting-ip') ?? ''),
+        // 落盘能力由自建入口注入（导入前快照要写文件）；边缘运行时没有文件系统，导入会被明确拒绝
+        files,
       });
       return json({ ok: true, action, ...result });
     }

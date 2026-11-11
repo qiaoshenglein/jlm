@@ -1,18 +1,19 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { toast } from 'sonner';
-import { api, ApiError, messageFor } from '../api';
+import { api, ApiError, messageFor, writeToken } from '../api';
 import {
   MARKET_NAME, SIDE_LABEL, STATUS_LABEL, clockTime, marketOfSecid, money, percent, ratioText, tone,
   type Market,
 } from '../format';
 
-type Tab = 'overview' | 'users' | 'orders' | 'settings' | 'quote' | 'audit';
+type Tab = 'overview' | 'users' | 'orders' | 'settings' | 'quote' | 'backup' | 'audit';
 const TABS: { key: Tab; label: string }[] = [
   { key: 'overview', label: '概览' },
   { key: 'users', label: '账户' },
   { key: 'orders', label: '流水' },
   { key: 'settings', label: '参数' },
   { key: 'quote', label: '行情源' },
+  { key: 'backup', label: '备份' },
   { key: 'audit', label: '审计' },
 ];
 
@@ -34,8 +35,8 @@ type Overview = {
   risk: { belowCall: number; belowLiquid: number; leveraged: number };
   quote?: {
     source: string; lastCheck: LastCheck | null;
-    cn: { ok: boolean; fresh: boolean; rows: number; note: string | null; partial: string; dataAgeMinutes: number | null; staleWarn: boolean };
-    us: { ok: boolean; fresh: boolean; rows: number; note: string | null; partial: string; dataAgeMinutes: number | null; staleWarn: boolean };
+    cn: { ok: boolean; fresh: boolean; rows: number; note: string | null; partial: string; dataAgeMinutes: number | null; staleWarn: boolean; sourceLabel?: string | null; fellBack?: boolean };
+    us: { ok: boolean; fresh: boolean; rows: number; note: string | null; partial: string; dataAgeMinutes: number | null; staleWarn: boolean; sourceLabel?: string | null; fellBack?: boolean };
   };
 };
 type OrderRow = {
@@ -53,28 +54,73 @@ type AuditRow = { id: string; actor: string | null; action: string; target: stri
 
 type QuoteSource = {
   listHost: string; singleHost: string; histHost: string; searchHost: string;
+  txQuoteHost: string; txListHost: string; txHistHost: string; txKlineHost: string;
+  sinaQuoteHost: string; sinaListHost: string; sinaHistHost: string;
   timeoutMs: number; cnTtlMs: number; usTtlMs: number; fxTtlMs: number;
   trendsTtlMs: number; klineTtlMs: number; cnPoolSize: number; usPoolSize: number; indexPoolSize: number;
   etfs: string[]; staleWarnMinutes: number;
+  sourceOrder: string[]; fallbackEnabled: boolean; cooldownMs: number;
 };
+type ProviderState = {
+  key: string; label: string; hosts: string[]; caps: string[]; rank: number; enabled: boolean;
+  failStreak: number; coolingFor: number; lastError: string | null; lastOkAt: string | null; lastMs: number | null;
+};
+type CoverageRow = { cap: string; label: string; ok: boolean; providers: string[]; failures: string[] };
 type QuoteHealth = {
   market: string; ok: boolean; fresh: boolean; rows: number; note: string | null; partial: string;
   ageMs: number | null; ttlMs: number; day: string; today: string; dataTs: number | null;
   dataAgeMinutes: number | null; staleWarn: boolean; host: string;
+  source: string | null; sourceLabel: string | null; fellBack: boolean;
 };
 type QuoteStatus = {
   source: QuoteSource; defaults: QuoteSource; hosts: string[];
-  probes: { key: string; label: string; note: string }[];
-  health: { cn: QuoteHealth; us: QuoteHealth }; fx: number; lastCheck: LastCheck | null;
+  probes: { key: string; label: string; note: string; provider: string; providerLabel: string; cap: string }[];
+  providers: ProviderState[];
+  health: { cn: QuoteHealth; us: QuoteHealth }; fx: number;
+  fxSource: { provider: string | null; label: string | null; fallback: boolean };
+  lastCheck: LastCheck | null;
 };
 type ProbeRow = {
   key: string; label?: string; host?: string; ok: boolean; ms: number;
+  provider?: string; providerLabel?: string; cap?: string; note?: string;
   rows?: number; sample?: string; ts?: number | null; error?: string;
 };
-type LastCheck = { at: string; verdict: string; okCount: number; total: number; slowest: number };
+type LastCheck = { at: string; verdict: string; okCount: number; total: number; slowest: number; activeSource?: string | null };
 type QuoteCheck = {
   results: ProbeRow[]; verdict: 'ok' | 'partial' | 'down'; okCount: number; total: number;
+  coverage: CoverageRow[]; dead: string[]; providers: ProviderState[];
   health: { cn: QuoteHealth; us: QuoteHealth }; advice: string[]; source: QuoteSource; checkedAt: string;
+};
+
+type BackupCounts = Record<string, number>;
+type BackupDocument = {
+  format: string; version: number; created_at: string; rows: number; bytes: number; checksum: string;
+  counts: BackupCounts; meta: { driver: string | null; scopes: string[]; by: string | null };
+  tables: Record<string, unknown[]>;
+};
+type PlanRow = { table: string; current: number | null; incoming: number; action: string };
+type BackupPlan = { mode: string; rows: PlanRow[]; notes: string[]; checksum: string; rows_to_write: number };
+type BackupPreview = {
+  rows: number; counts: BackupCounts; checksum: string; warnings: string[]; admins: number;
+  modes: { replace: boolean; config: boolean }; created_at: string;
+  meta: { driver: string | null; scopes: string[]; by: string | null };
+  plans: Partial<Record<'replace' | 'config', BackupPlan>>;
+};
+type BackupApplied = {
+  mode: string; applied: BackupCounts; cleared: BackupCounts; rows: number; took_ms: number;
+  checksum: string; reauth_required: boolean; regranted: string[];
+  snapshot: { path: string; bytes: number; kept: number; removed: number } | null;
+};
+type BackupProblem = { table: string | null; message: string };
+const TABLE_LABEL: Record<string, string> = {
+  users: '账户', sessions: '会话', orders: '委托', trades: '成交', events: '事件',
+  snapshots: '日结快照', watchlists: '自选', settings: '配置', audit: '审计', api_keys: 'API 密钥',
+};
+const SCOPE_HINT: Record<string, [string, string]> = {
+  data: ['全站业务数据', '账户、委托、成交、快照、自选、API 密钥'],
+  config: ['全站配置', '挂牌参数、行情源、注册开关、熔断'],
+  audit: ['审计流水', '后台操作留痕，导入时永远只追加'],
+  sessions: ['会话摘要', '勾上后旧实例已登录的浏览器在新实例继续有效'],
 };
 
 // 数值项的展示顺序与说明；边界值由服务端校验，这里只负责写清楚每一项在管什么
@@ -89,13 +135,44 @@ const SOURCE_FIELDS: { key: keyof QuoteSource; label: string; hint: string }[] =
   { key: 'usPoolSize', label:  '美股池', hint: '三个交易所合起来取前 N 只' },
   { key: 'indexPoolSize', label: '指数池', hint: '条数' },
   { key: 'staleWarnMinutes', label: '数据落后告警', hint: '分钟，只影响检测结论' },
+  { key: 'cooldownMs', label: '失败源冷却', hint: '毫秒，这段时间内不再打它' },
 ];
-const HOST_FIELDS: { key: keyof QuoteSource; label: string; hint: string }[] = [
-  { key: 'listHost', label: '板块接口域名', hint: '沪深与美股池、美股指数都走它' },
-  { key: 'singleHost', label: '单标的域名', hint: '池外标的补价与汇率' },
-  { key: 'histHost', label: '历史接口域名', hint: '分时与日 K' },
-  { key: 'searchHost', label: '检索接口域名', hint: '代码联想' },
+// 域名按源分组：换源不是改一个 URL，而是整家换，分组才不会配出「东财的域名 + 腾讯的路径」这种组合
+const PROVIDER_HOST_FIELDS: { key: string; label: string; fields: { key: keyof QuoteSource; label: string; hint: string }[] }[] = [
+  {
+    key: 'eastmoney',
+    label: '东方财富',
+    fields: [
+      { key: 'listHost', label: '板块接口域名', hint: '沪深与美股池、美股指数都走它' },
+      { key: 'singleHost', label: '单标的域名', hint: '池外标的补价与汇率' },
+      { key: 'histHost', label: '历史接口域名', hint: '分时与日 K' },
+      { key: 'searchHost', label: '检索接口域名', hint: '代码联想' },
+    ],
+  },
+  {
+    key: 'tencent',
+    label: '腾讯财经',
+    fields: [
+      { key: 'txQuoteHost', label: '快照域名（GBK）', hint: '个股/ETF/指数/美股批量报价' },
+      { key: 'txListHost', label: '排行域名', hint: 'A 股成交额榜，降级时的池子来源' },
+      { key: 'txHistHost', label: '分时域名', hint: '当日分钟线' },
+      { key: 'txKlineHost', label: '日 K 域名', hint: '蜡烛图；美股必须带交易所后缀' },
+    ],
+  },
+  {
+    key: 'sina',
+    label: '新浪财经',
+    fields: [
+      { key: 'sinaQuoteHost', label: '快照域名（GBK）', hint: '个股/ETF/指数批量报价' },
+      { key: 'sinaListHost', label: '排行域名', hint: '每页 80 条，分页取' },
+      { key: 'sinaHistHost', label: '日 K 域名', hint: '字段序与东财不同，已按实测对齐' },
+    ],
+  },
 ];
+const CAP_LABEL: Record<string, string> = {
+  cnStocks: '沪深个股池', cnIndexes: '沪深指数', cnEtfs: 'ETF 补价', usStocks: '美股池', usIndexes: '美股指数',
+  one: '单标的', fx: '汇率', trends: '分时', kline: '日 K', suggest: '检索',
+};
 
 const ACTION_LABEL: Record<string, string> = {
   admin_freeze: '冻结账户', admin_unfreeze: '解冻账户', admin_unlock: '解除登录锁定',
@@ -153,6 +230,15 @@ export function Admin({ onExit }: { onExit: () => void }) {
   const [quoteDraft, setQuoteDraft] = useState<QuoteSource | null>(null);
   const [check, setCheck] = useState<QuoteCheck | null>(null);
   const [checking, setChecking] = useState(false);
+  const [scopes, setScopes] = useState({ data: true, config: true, audit: true, sessions: false });
+  const [doc, setDoc] = useState<BackupDocument | null>(null);
+  const [picked, setPicked] = useState<{ name: string; bytes: number; document: BackupDocument } | null>(null);
+  const [preview, setPreview] = useState<BackupPreview | null>(null);
+  const [problems, setProblems] = useState<BackupProblem[] | null>(null);
+  const [ack, setAck] = useState('');
+  const [previewError, setPreviewError] = useState<string | null>(null);
+  const [busy, setBusy] = useState('');
+  const [applied, setApplied] = useState<BackupApplied | null>(null);
   const [loading, setLoading] = useState(false);
   const timer = useRef(0);
 
@@ -227,6 +313,112 @@ export function Admin({ onExit }: { onExit: () => void }) {
     } catch (error) {
       toast.error(error instanceof ApiError ? error.message : messageFor('request_failed'));
     }
+  }
+
+  // ---- 备份页 ----
+  const fileName = () => `mirror-backup-${(doc?.created_at ?? new Date().toISOString()).replace(/[:.]/g, '-').slice(0, 19)}.json`;
+
+  async function makeExport() {
+    setBusy('export');
+    try {
+      const result = await api<{ document: BackupDocument }>('admin_backup_export', { include: scopes });
+      setDoc(result.document);
+      setApplied(null);
+      toast.success(`已导出 ${result.document.rows} 行`);
+    } catch (error) {
+      toast.error(error instanceof ApiError ? error.message : '导出失败');
+    } finally {
+      setBusy('');
+    }
+  }
+
+  function download() {
+    if (!doc) return;
+    const blob = new Blob([JSON.stringify(doc)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = fileName();
+    link.click();
+    // Blob 会挂在页面上直到手动释放，否则切几次页就攒出几份整库副本
+    window.setTimeout(() => URL.revokeObjectURL(url), 30_000);
+    toast.success(`已保存 ${fileName()}`);
+  }
+
+  async function pickFile(file: File | undefined) {
+    if (!file) return;
+    setBusy('read');
+    setPreview(null);
+    setPreviewError(null);
+    try {
+      const parsed = JSON.parse(await file.text()) as BackupDocument;
+      setPicked({ name: file.name, bytes: file.size, document: parsed });
+      toast.success(`已读取 ${file.name}`);
+    } catch (error) {
+      setPicked(null);
+      setPreviewError(`这个文件读不出来：${error instanceof Error ? error.message : '不是合法 JSON'}`);
+      toast.error('文件无法解析');
+    } finally {
+      setBusy('');
+    }
+  }
+
+  async function runPreview() {
+    if (!picked) return;
+    setBusy('preview');
+    setPreviewError(null);
+    try {
+      const result = await api<BackupPreview>('admin_backup_preview', { document: picked.document });
+      setPreview(result);
+      setAck('');
+      setApplied(null);
+    } catch (error) {
+      setPreview(null);
+      setPreviewError(error instanceof ApiError ? error.message : '预检失败');
+      toast.error('预检未通过，未做任何改动');
+    } finally {
+      setBusy('');
+    }
+  }
+
+  async function runImport(mode: 'replace' | 'config') {
+    if (!picked || !preview) return;
+    setBusy(`apply:${mode}`);
+    setPreviewError(null);
+    try {
+      const result = await api<BackupApplied>('admin_backup_apply', {
+        document: picked.document, mode, ack: ack.trim(), confirm: true,
+      });
+      setApplied(result);
+      toast.success(result.mode === 'replace' ? '整库已按文件恢复' : '配置已并回');
+    } catch (error) {
+      setPreviewError(error instanceof ApiError ? error.message : '导入失败');
+      toast.error('导入未完成');
+    } finally {
+      setBusy('');
+    }
+  }
+
+  function relogin() {
+    writeToken(null);
+    window.location.hash = '';
+    window.location.reload();
+  }
+
+  // 覆盖整库要「打字确认 + 二次点击」两道闸：前者证明看过预检，后者防手滑
+  function confirmThen(key: string, note: string, run: () => void) {
+    if (pending !== key) { setPending(key); toast('再点一次以确认', { description: note }); return; }
+    setPending('');
+    run();
+  }
+
+  // 源序只改草稿，保存后才生效；换序会清掉缓存与冷却，下一次同步立刻按新序走
+  function moveSource(index: number, delta: number) {
+    const next = [...quoteDraft?.sourceOrder ?? []];
+    const target = index + delta;
+    if (target < 0 || target >= next.length) return;
+    [next[index], next[target]] = [next[target], next[index]];
+    setQuoteDraft({ ...quoteDraft!, sourceOrder: next });
   }
 
   return (
@@ -533,7 +725,8 @@ export function Admin({ onExit }: { onExit: () => void }) {
 
             <section className="rounded border border-hairline bg-raised p-3">
               <div className="flex flex-wrap items-center gap-2">
-                <MiniButton armedKey="" pending="" text="立即检测八个端点" kind="primary"
+                <MiniButton armedKey="" pending="" text={checking ? '检测中…' : `立即检测 ${quote.probes.length} 项`} kind="primary"
+                  disabled={checking}
                   onFire={async () => {
                     setChecking(true);
                     try {
@@ -545,11 +738,11 @@ export function Admin({ onExit }: { onExit: () => void }) {
                       setChecking(false);
                     }
                   }} />
-                {checking && <span className="text-[0.75rem] text-ink-dim">探测中…</span>}
+                {checking && <span className="text-[0.75rem] text-ink-dim">逐源逐能力实测中…</span>}
                 {check && (
                   <span className={`chip num ${check.verdict === 'ok' ? 'border-down/40 bg-down/12 text-down'
                     : check.verdict === 'partial' ? 'border-warn/50 bg-warn/12 text-warn' : 'border-up/45 bg-up/12 text-up'}`}>
-                    {check.verdict === 'ok' ? '全部可用' : check.verdict === 'partial' ? '部分可用' : '全部不可用'}
+                    {check.verdict === 'ok' ? '能力齐全' : check.verdict === 'partial' ? `缺 ${check.dead.length} 项能力` : '全部不可用'}
                     {' '}{check.okCount}/{check.total} · 最慢 {Math.max(...check.results.map((row) => row.ms), 0)}ms
                   </span>
                 )}
@@ -561,21 +754,21 @@ export function Admin({ onExit }: { onExit: () => void }) {
 
               {check && (
                 <div className="mt-3 overflow-x-auto">
-                  <table className="w-full min-w-[46rem] border-collapse text-[0.8125rem]">
+                  <table className="w-full min-w-[52rem] border-collapse text-[0.8125rem]">
                     <thead>
                       <tr className="border-b border-hairline text-left text-[0.6875rem] text-ink-dim">
-                        {['端点', '结果', '耗时', '域名', '条数', '样本', '说明'].map((head) => <th key={head} className="px-2 py-1 font-normal">{head}</th>)}
+                        {['源', '能力', '结果', '耗时', '条数', '样本', '说明'].map((head) => <th key={head} className="px-2 py-1 font-normal">{head}</th>)}
                       </tr>
                     </thead>
                     <tbody>
                       {check.results.map((row) => (
                         <tr key={row.key} className="border-b border-hairline/40">
-                          <td className="px-2 py-1.5">{row.label ?? row.key}</td>
+                          <td className="px-2 py-1.5 text-[0.75rem] text-ink-dim">{row.providerLabel ?? row.provider}</td>
+                          <td className="px-2">{row.label ?? row.cap}</td>
                           <td className="px-2"><Badge text={row.ok ? '可用' : '不可用'} kind={row.ok ? 'down' : 'up'} /></td>
                           <td className={`num px-2 text-right ${row.ms > 1500 ? 'text-warn' : ''}`}>{row.ms}ms</td>
-                          <td className="num px-2 text-[0.75rem] text-ink-dim">{row.host ?? '—'}</td>
                           <td className="num px-2 text-right">{row.rows ?? '—'}</td>
-                          <td className="num max-w-[16rem] truncate px-2 text-[0.75rem] text-ink-dim" title={row.sample ?? ''}>{row.sample || '—'}</td>
+                          <td className="num max-w-[15rem] truncate px-2 text-[0.75rem] text-ink-dim" title={row.sample ?? ''}>{row.sample || '—'}</td>
                           <td className="max-w-[18rem] truncate px-2 text-[0.75rem] text-up" title={row.error ?? ''}>{row.error || '—'}</td>
                         </tr>
                       ))}
@@ -590,23 +783,71 @@ export function Admin({ onExit }: { onExit: () => void }) {
               )}
             </section>
 
+            <section>
+              <h3 className="mb-1.5 text-[0.6875rem] tracking-[0.08em] text-primary">源序与降级</h3>
+              <div className="flex flex-col gap-1.5">
+                {quoteDraft.sourceOrder.map((key, index) => {
+                  const info = quote.providers.find((item) => item.key === key);
+                  return (
+                    <div key={key} className="flex flex-wrap items-center gap-2 rounded border border-hairline bg-raised px-3 py-2 text-xs">
+                      <span className="num w-5 text-[0.6875rem] text-ink-dim">{index + 1}</span>
+                      <span className="min-w-[6rem] font-medium">{info?.label ?? key}</span>
+                      {index === 0 && <Badge text="首选" kind="primary" />}
+                      {(quote.health.cn.source === key || quote.health.us.source === key) && <Badge text="当前在用" kind="down" />}
+                      {info?.coolingFor ? <Badge text={`冷却 ${info.coolingFor}s`} kind="muted" /> : null}
+                      <span className="num text-[0.6875rem] text-ink-dim">
+                        {info?.lastOkAt ? `最近可用 ${clockTime(info.lastOkAt)}${info.lastMs != null ? ` · ${info.lastMs}ms` : ''}` : '还没成功过'}
+                        {info?.failStreak ? ` · 连续失败 ${info.failStreak}` : ''}
+                      </span>
+                      <span className="num max-w-[18rem] truncate text-[0.6875rem] text-up" title={info?.lastError ?? ''}>{info?.lastError ?? ''}</span>
+                      <span className="ml-auto flex gap-1">
+                        <MiniButton armedKey="" pending="" text="↑" disabled={index === 0}
+                          onFire={() => moveSource(index, -1)} />
+                        <MiniButton armedKey="" pending="" text="↓" disabled={index === quoteDraft.sourceOrder.length - 1}
+                          onFire={() => moveSource(index, 1)} />
+                      </span>
+                    </div>
+                  );
+                })}
+              </div>
+              <label className="mt-2 flex items-start gap-2 rounded border border-hairline bg-panel px-3 py-2 text-xs">
+                <input type="checkbox" className="mt-1 accent-[var(--primary)]" checked={quoteDraft.fallbackEnabled}
+                  onChange={(event) => setQuoteDraft({ ...quoteDraft, fallbackEnabled: event.target.checked })} aria-label="允许自动降级" />
+                <span>允许自动降级<span className="block text-[0.6875rem] text-ink-dim">
+                  关掉后只用首选源，它挂了就不刷新行情（宁可用上次快照，也不换一家口径不同的源）
+                </span></span>
+              </label>
+            </section>
+
             <p className="text-[0.75rem] leading-6 text-ink-dim">
-              域名只能从实测可用的清单里选：本运行时按 UTF-8 解 JSON，换成腾讯 / 新浪这类 GBK 源会整片乱码；
-              而允许填任意主机等于给服务端开一个内网探测口。保存后缓存立即清空，下一次同步就用新配置，不用重启。
+              每家源的字段口径都逐项实测过（价格、昨收、涨跌停、成交额、市值、时间戳），横向对照同一标的三家价格一致才接进链里。
+              编码按接口不同：东财 UTF-8，腾讯 / 新浪的快照是 GBK，自建 Node 用 TextDecoder 解；边缘运行时若不带 GBK 解码器，
+              那两家会整片报 gbk_unsupported 并自动跳过，撮合仍走东财。域名只能从清单里选——填任意主机等于给服务端开一个内网探测口。
+              保存后缓存与冷却立即清空，下一次同步就用新配置，不用重启。
             </p>
 
             <section>
-              <h3 className="mb-1.5 text-[0.6875rem] tracking-[0.08em] text-primary">接口域名</h3>
-              <div className="grid gap-2 sm:grid-cols-2">
-                {HOST_FIELDS.map((field) => (
-                  <label key={field.key} className="flex items-center justify-between gap-3 rounded border border-hairline bg-raised px-3 py-2 text-xs">
-                    <span>{field.label}<span className="block text-[0.6875rem] text-ink-dim">{field.hint}</span></span>
-                    <select value={String(quoteDraft[field.key])} aria-label={field.label}
-                      onChange={(event) => setQuoteDraft({ ...quoteDraft, [field.key]: event.target.value })}
-                      className="num h-8 max-w-[15rem] rounded border border-hairline bg-panel px-1 text-[0.75rem] outline-none focus:border-input">
-                      {quote.hosts.map((host) => <option key={host} value={host}>{host}</option>)}
-                    </select>
-                  </label>
+              <h3 className="mb-1.5 text-[0.6875rem] tracking-[0.08em] text-primary">各家域名</h3>
+              <div className="flex flex-col gap-2.5">
+                {PROVIDER_HOST_FIELDS.map((group) => (
+                  <div key={group.key}>
+                    <div className="mb-1 flex items-center gap-2 text-[0.6875rem] text-ink-dim">
+                      <span className="text-primary">{group.label}</span>
+                      <span className="num">{quote.providers.find((item) => item.key === group.key)?.hosts.join(' · ')}</span>
+                    </div>
+                    <div className="grid gap-2 sm:grid-cols-2">
+                      {group.fields.map((field) => (
+                        <label key={field.key} className="flex items-center justify-between gap-3 rounded border border-hairline bg-raised px-3 py-2 text-xs">
+                          <span>{field.label}<span className="block text-[0.6875rem] text-ink-dim">{field.hint}</span></span>
+                          <select value={String(quoteDraft[field.key])} aria-label={`${group.label} ${field.label}`}
+                            onChange={(event) => setQuoteDraft({ ...quoteDraft, [field.key]: event.target.value })}
+                            className="num h-8 max-w-[15rem] rounded border border-hairline bg-panel px-1 text-[0.75rem] outline-none focus:border-input">
+                            {quote.hosts.map((host) => <option key={host} value={host}>{host}</option>)}
+                          </select>
+                        </label>
+                      ))}
+                    </div>
+                  </div>
                 ))}
               </div>
             </section>
@@ -639,6 +880,157 @@ export function Admin({ onExit }: { onExit: () => void }) {
             </div>
           </div>
         ) : <Empty text="行情源加载中…" />)}
+
+        {tab === 'backup' && (
+          <div className="flex flex-col gap-3 text-sm">
+            <p className="text-[0.75rem] leading-6 text-ink-dim">
+              导出是一份自描述的 JSON：十张表按列白名单逐行校验，配置与账本同进同出。
+              导入前必看预检对照表；覆盖整库之前，服务端会先把当前数据写成快照文件（默认 <span className="num">data/backups/</span>，保留最近 10 份），
+              落不下去就不执行覆盖。审计流水永远只追加——导入不会抹掉「谁导入过」这条记录本身。
+            </p>
+
+            <section className="rounded border border-hairline bg-raised p-3">
+              <h3 className="mb-2 text-[0.6875rem] tracking-[0.08em] text-primary">导出</h3>
+              <div className="grid gap-1.5 sm:grid-cols-2">
+                {(['data', 'config', 'audit', 'sessions'] as const).map((key) => (
+                  <label key={key} className="flex items-start gap-2 rounded border border-hairline bg-panel px-2.5 py-1.5 text-xs">
+                    <input type="checkbox" className="mt-1 accent-[var(--primary)]" checked={scopes[key]}
+                      onChange={(event) => setScopes({ ...scopes, [key]: event.target.checked })} aria-label={SCOPE_HINT[key][0]} />
+                    <span>{SCOPE_HINT[key][0]}<span className="block text-[0.6875rem] text-ink-dim">{SCOPE_HINT[key][1]}</span></span>
+                  </label>
+                ))}
+              </div>
+              <div className="mt-2 flex flex-wrap items-center gap-2">
+                <MiniButton armedKey="" pending="" text={busy === 'export' ? '导出中…' : '生成导出'} kind="primary"
+                  disabled={busy === 'export'} onFire={() => void makeExport()} />
+                {doc && (
+                  <MiniButton armedKey="" pending="" text="下载 JSON" onFire={download} />
+                )}
+                {doc && (
+                  <span className="num text-[0.6875rem] text-ink-dim">
+                    {doc.rows} 行 · {Math.max(1, Math.round(doc.bytes / 1024))}KB · checksum {doc.checksum.slice(0, 12)}
+                  </span>
+                )}
+              </div>
+              {doc && (
+                <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-[0.75rem]">
+                  {Object.entries(doc.counts).map(([name, n]) => (
+                    <span key={name} className="num text-ink-dim">{TABLE_LABEL[name] ?? name} <b className="text-foreground">{n}</b></span>
+                  ))}
+                </div>
+              )}
+              {doc && (
+                <p className="mt-2 text-[0.6875rem] leading-5 text-warn">
+                  文件里有口令散列（PBKDF2）与 API 密钥摘要（SHA-256），都不可逆，但仍要当凭据保管；带会话摘要的导出不例外。
+                </p>
+              )}
+            </section>
+
+            <section className="rounded border border-hairline bg-raised p-3">
+              <h3 className="mb-2 text-[0.6875rem] tracking-[0.08em] text-primary">导入</h3>
+              <div className="flex flex-wrap items-center gap-2">
+                <label className="flex items-center gap-2 rounded border border-hairline bg-panel px-2.5 py-1.5 text-xs">
+                  <span className="text-ink-dim">备份文件</span>
+                  <input type="file" accept="application/json,.json" aria-label="备份文件"
+                    onChange={(event) => void pickFile(event.target.files?.[0])}
+                    className="num max-w-[18rem] text-[0.75rem] file:mr-2 file:rounded file:border-0 file:bg-surface-2 file:px-2 file:py-1 file:text-[0.6875rem]" />
+                </label>
+                {picked && (
+                  <span className="num text-[0.6875rem] text-ink-dim">{Math.max(1, Math.round(picked.bytes / 1024))}KB</span>
+                )}
+                <MiniButton armedKey="" pending="" text={busy === 'preview' ? '预检中…' : '预检'} kind="primary"
+                  disabled={!picked || busy === 'preview'} onFire={() => void runPreview()} />
+              </div>
+              {!picked && !previewError && (
+                <p className="mt-2 text-[0.6875rem] text-ink-dim">
+                  选择文件后先预检：逐表列出「当前 → 文件」的行数与动作，问题项在这里挡住，不会写进数据库。
+                  大库建议用命令行：<span className="num">node scripts/backup.mjs import 文件 --mode replace --yes</span>
+                </p>
+              )}
+              {previewError && (
+                <p className="mt-2 rounded border border-up/40 bg-up/10 px-2 py-1.5 text-[0.75rem] leading-5 text-up">{previewError}</p>
+              )}
+
+              {preview && (
+                <div className="mt-3 flex flex-col gap-3">
+                  <div className="flex flex-wrap items-center gap-2 text-[0.75rem]">
+                    <Badge text={`校验通过 · ${preview.rows} 行`} kind="down" />
+                    <span className="num text-ink-dim">导出于 {preview.created_at ? clockTime(preview.created_at) : '未知'} · 源驱动 {preview.meta.driver ?? '未知'}</span>
+                    <span className="num text-ink-dim">checksum <b className="text-foreground">{preview.checksum.slice(0, 12)}</b></span>
+                  </div>
+
+                  {(['replace', 'config'] as const).map((mode) => {
+                    const plan = preview.plans[mode];
+                    if (!plan) return null;
+                    return (
+                      <div key={mode} className="overflow-x-auto">
+                        <h4 className="mb-1 text-[0.6875rem] text-ink-dim">
+                          {mode === 'replace' ? '覆盖全站：清空范围内各表后按文件写入（审计只追加）' : '只并配置：仅按 key 并回 settings，业务数据一行不碰'}
+                        </h4>
+                        <table className="w-full min-w-[34rem] border-collapse text-[0.75rem]">
+                          <thead>
+                            <tr className="border-b border-hairline text-left text-[0.6875rem] text-ink-dim">
+                              {['表', '当前', '文件', '动作'].map((head) => <th key={head} className="px-2 py-1 font-normal">{head}</th>)}
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {plan.rows.map((row) => (
+                              <tr key={row.table} className="border-b border-hairline/40">
+                                <td className="px-2 py-1">{TABLE_LABEL[row.table] ?? row.table}</td>
+                                <td className="num px-2 text-right">{row.current ?? '—'}</td>
+                                <td className="num px-2 text-right">{row.incoming}</td>
+                                <td className={`px-2 ${row.action.startsWith('清空') ? 'text-up' : 'text-ink-dim'}`}>{row.action}</td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                        {plan.notes.map((note) => <p key={note} className="mt-1 text-[0.6875rem] leading-5 text-warn">注意 {note}</p>)}
+                      </div>
+                    );
+                  })}
+
+                  {preview.warnings.length > 0 && (
+                    <ul className="space-y-1 text-[0.6875rem] leading-5 text-ink-dim">
+                      {preview.warnings.map((line) => <li key={line} className="border-l border-hairline pl-2">{line}</li>)}
+                    </ul>
+                  )}
+
+                  <div className="flex flex-wrap items-center gap-2">
+                    <input value={ack} onChange={(event) => setAck(event.target.value)} placeholder="输入校验和前 6 位"
+                      aria-label="校验和前 6 位"
+                      className="num h-8 w-32 rounded border border-hairline bg-panel px-2 text-xs outline-none focus:border-input" />
+                    <span className="num text-[0.6875rem] text-ink-dim">{preview.checksum.slice(0, 6)}</span>
+                    <MiniButton armedKey="import-replace" pending={pending} text="确认覆盖全站" armed="再点一次执行覆盖" kind="primary"
+                      disabled={!preview.modes.replace || ack.trim().toLowerCase() !== preview.checksum.slice(0, 6)}
+                      onFire={() => confirmThen('import-replace', '覆盖整库前请确认已看过上面的对照表', () => void runImport('replace'))} />
+                    <MiniButton armedKey="import-config" pending={pending} text="只并配置" armed="再点一次并回配置"
+                      disabled={!preview.modes.config || ack.trim().toLowerCase() !== preview.checksum.slice(0, 6)}
+                      onFire={() => confirmThen('import-config', '只并 settings，业务数据不受影响', () => void runImport('config'))} />
+                  </div>
+                </div>
+              )}
+
+              {applied && (
+                <div className="mt-3 rounded border border-down/40 bg-down/10 p-2.5 text-[0.75rem] leading-6">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <Badge text={applied.mode === 'replace' ? '整库已恢复' : '配置已并回'} kind="down" />
+                    <span className="num text-ink-dim">{applied.rows} 行 · {applied.took_ms}ms</span>
+                  </div>
+                  <p className="num mt-1 break-all text-ink-dim">导入前快照：{applied.snapshot?.path ?? '无'}</p>
+                  {applied.regranted.length > 0 && <p className="text-ink-dim">按 ADMIN_USERNAMES 重新授予管理员：{applied.regranted.join('、')}</p>}
+                  {applied.reauth_required ? (
+                    <div className="mt-1.5 flex flex-wrap items-center gap-2">
+                      <span className="text-warn">文件里没有会话：所有人的登录状态已失效，包括你自己。</span>
+                      <MiniButton armedKey="" pending="" text="去重新登录" kind="primary" onFire={relogin} />
+                    </div>
+                  ) : (
+                    <span className="text-ink-dim">当前登录状态仍然有效，参数缓存最多 2 秒后自动跟上。</span>
+                  )}
+                </div>
+              )}
+            </section>
+          </div>
+        )}
 
         {tab === 'audit' && (audit === null ? <Empty text="审计加载中…" /> : audit.length === 0 ? <Empty text="还没有后台操作记录" /> : (
           <div className="overflow-x-auto">
@@ -676,9 +1068,12 @@ function OverviewPane({ data }: { data: Overview }) {
       const down = !q.cn.ok && !q.cn.rows && !q.us.ok && !q.us.rows;
       const stale = !q.cn.fresh || !q.us.fresh;
       const degraded = Boolean(q.cn.partial || q.us.partial);
+      const fellBack = Boolean(q.cn.fellBack || q.us.fellBack);
+      const active = q.cn.sourceLabel || q.us.sourceLabel || null;
       return {
         label: down ? '取不到' : degraded ? '部分降级' : stale ? '非当日' : '正常',
         hint: `沪深 ${q.cn.rows} 条 · 美股 ${q.us.rows} 条`
+          + (fellBack && active ? ` · 已换 ${active}` : '')
           + (q.cn.note || q.us.note ? ` · 上游错误 ${q.cn.note ?? q.us.note}` : '')
           + (down ? ' · 去「行情源」页逐项定位'
             : q.lastCheck ? ` · 上次检测 ${q.lastCheck.okCount}/${q.lastCheck.total} 可用` : ''),
@@ -763,6 +1158,11 @@ function HealthCard({ item, fx }: { item: QuoteHealth; fx: number }) {
         系统日 {item.today} · 数据日 {item.day || '空'} · {item.fresh ? '当日数据，可撮合' : '非当日数据，不撮合'}
       </p>
       <p className="num truncate text-[0.6875rem] leading-5" title={item.host}>{item.host}</p>
+      {item.sourceLabel && (
+        <p className="text-[0.6875rem] leading-5">
+          当前源 {item.sourceLabel}{item.fellBack && <span className="text-warn"> · 已降级（首选源取不到）</span>}
+        </p>
+      )}
       {(item.note || item.partial) && (
         <p className="mt-1 text-[0.6875rem] leading-5">{item.note ? `上游错误：${item.note}` : ''}{item.partial ? ` · 降级：${item.partial}` : ''}</p>
       )}

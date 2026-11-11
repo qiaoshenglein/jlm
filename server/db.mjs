@@ -203,6 +203,11 @@ class SqlClient {
   }
 
   columnPatches() { return []; }
+
+  // 备份导入要「全有或全无」：同一连接里跑完所有语句，任何异常一律 ROLLBACK。
+  // fn 收到 run(sql, params) → { rows, changes }：SELECT 看 rows，写语句看 changes。
+  // 只有拿到真实连接的驱动能实现；缺省时抛错，让上层明确拒绝而不是静默非原子。
+  async withTx() { throw new Error('withTx_unsupported'); }
 }
 
 class SqliteClient extends SqlClient {
@@ -236,6 +241,25 @@ class SqliteClient extends SqlClient {
   }
 
   async exec(script) { this.db.exec(script); }
+
+  async withTx(fn) {
+    // BEGIN IMMEDIATE：WAL 下先拿到写锁，避免事务中途撞 busy_timeout
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const out = await fn((sql, params = []) => {
+        const statement = this.db.prepare(sql);
+        if (/^\s*select\b/i.test(sql)) return { rows: statement.all(...params), changes: 0 };
+        const info = statement.run(...params);
+        return { rows: [], changes: Number(info?.changes ?? 0) };
+      });
+      this.db.exec('COMMIT');
+      return out;
+    } catch (error) {
+      try { this.db.exec('ROLLBACK'); } catch { /* 已被 SQLite 回滚 */ }
+      throw error;
+    }
+  }
+
   async close() { this.db.close(); }
 }
 
@@ -267,6 +291,26 @@ class PgClient extends SqlClient {
   }
 
   async exec(script) { await this.pool.query(script); }
+
+  // 事务必须绑在同一连接上：从池里借一条，用完再还，否则 BEGIN/COMMIT 会落在不同会话里。
+  async withTx(fn) {
+    const conn = await this.pool.connect();
+    try {
+      await conn.query('BEGIN');
+      const out = await fn(async (sql, params = []) => {
+        const result = await conn.query(sql, params);
+        return { rows: result.rows ? result.rows.map(normalizeRow) : [], changes: Number(result.rowCount ?? 0) };
+      });
+      await conn.query('COMMIT');
+      return out;
+    } catch (error) {
+      try { await conn.query('ROLLBACK'); } catch { /* 连接已断，服务端会自己回滚 */ }
+      throw error;
+    } finally {
+      conn.release();
+    }
+  }
+
   async close() { await this.pool.end(); }
 }
 

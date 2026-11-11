@@ -1,31 +1,38 @@
-// 行情源：东方财富公开行情接口（UTF-8 JSON，无需密钥）。
+// 行情层：多家公开接口 + 按优先级依次降级。
 // 每个执行环境内做快照缓存（默认 2.5 秒），所有请求共享，避免高频打爆上游。
-import { FX_SECID, MICRO, bjParts, etParts, marketOf, secidOf, splitSecid, tradableOf, limitPricesOf, tickOf } from './rules.mjs';
+// 具体接口与字段口径在 quote-sources.mjs，这一层只管「现在用的是谁、什么时候换、坏了怎么退」。
+import { MICRO, bjParts, etParts, marketOf, splitSecid } from './rules.mjs';
+import {
+  INDEX_ETFS, KEY_INDEXES, PROVIDER_ORDER_DEFAULT, QUOTE_PROVIDERS, US_INDEXES,
+} from './quote-sources.mjs';
 
-const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36';
+// 指数与指数 ETF 名单定义在适配器层（三家都要用它点名取数），这里原样导出给接口层与前端
+export { INDEX_ETFS, KEY_INDEXES, US_INDEXES };
 
-// 主要指数：一次板块请求即可全部拿到，这里只规定展示顺序与重点标记
-export const KEY_INDEXES = [
-  ['1.000001', '上证指数'], ['0.399001', '深证成指'], ['0.399006', '创业板指'],
-  ['1.000300', '沪深300'], ['1.000016', '上证50'], ['1.000905', '中证500'],
-  ['1.000852', '中证1000'], ['1.000688', '科创50'], ['0.899050', '北证50'],
-  ['1.000985', '中证全指'],
-];
-
-// 场内指数 ETF：逐个标的取价（行情源批量接口不对外开放）
-export const INDEX_ETFS = ['1.510300', '1.510050', '1.510500', '1.588000', '0.159915', '0.159919', '1.512100', '0.159901'];
-
-// ---- 可热改的行情源配置 ----
-// 域名只给实测可用的白名单，不提供「任意填一个 URL」：
-// 一是本运行时按 UTF-8 解 JSON，换成 GBK 源（腾讯/新浪）会整片乱码；
-// 二是后台能填任意主机，等于给服务端开一个内网探测口（SSRF）。
-export const QUOTE_HOSTS = ['push2.eastmoney.com', 'push2delay.eastmoney.com', 'push2his.eastmoney.com', 'searchapi.eastmoney.com'];
+// 域名白名单：所有源的主机都在这里。填清单外的主机等于给服务端开一个内网探测口（SSRF），
+// 而且没核对过字段口径的源会让涨跌停、成交额、时间戳全部失真——那比没行情更危险。
+export const QUOTE_HOSTS = Object.values(QUOTE_PROVIDERS).flatMap((item) => item.hosts);
 
 export const QUOTE_SOURCE_DEFAULTS = {
-  listHost: 'push2.eastmoney.com',      // 板块批量（沪深 + 美股）
-  singleHost: 'push2.eastmoney.com',    // 单标的快照
-  histHost: 'push2his.eastmoney.com',   // 分时与日 K
-  searchHost: 'searchapi.eastmoney.com',// 代码检索
+  // 东方财富：字段最全，也是唯一有美股榜的；任何运行时都能解 UTF-8，所以默认排第一
+  listHost: 'push2.eastmoney.com',
+  singleHost: 'push2.eastmoney.com',
+  histHost: 'push2his.eastmoney.com',
+  searchHost: 'searchapi.eastmoney.com',
+  // 腾讯
+  txQuoteHost: 'qt.gtimg.cn',
+  txListHost: 'proxy.finance.qq.com',
+  txHistHost: 'ifzq.gtimg.cn',
+  txKlineHost: 'web.ifzq.gtimg.cn',
+  // 新浪
+  sinaQuoteHost: 'hq.sinajs.cn',
+  sinaListHost: 'vip.stock.finance.sina.com.cn',
+  sinaHistHost: 'quotes.sina.cn',
+
+  sourceOrder: [...PROVIDER_ORDER_DEFAULT], // 依次尝试，第一个成功的接管本轮
+  fallbackEnabled: true,                     // 关掉就只用首选源，不降级
+  cooldownMs: 60_000,                        // 失败的源在这段时间内不再尝试
+
   timeoutMs: 4_000,
   cnTtlMs: 2_500,
   usTtlMs: 5_000,     // 美股流动性好、盘口变化对仿真撮合影响小，5 秒一档减少上游压力
@@ -45,23 +52,29 @@ const SOURCE_LIMITS = {
   cnTtlMs: [500, 30_000], usTtlMs: [1_000, 60_000], fxTtlMs: [15_000, 900_000],
   trendsTtlMs: [5_000, 300_000], klineTtlMs: [60_000, 3_600_000],
   cnPoolSize: [50, 500], usPoolSize: [50, 500], indexPoolSize: [10, 120],
+  cooldownMs: [5_000, 900_000],
   staleWarnMinutes: [10, 1_440],
 };
-const HOST_KEYS = ['listHost', 'singleHost', 'histHost', 'searchHost'];
+const HOST_KEYS = ['listHost', 'singleHost', 'histHost', 'searchHost',
+  'txQuoteHost', 'txListHost', 'txHistHost', 'txKlineHost', 'sinaQuoteHost', 'sinaListHost', 'sinaHistHost'];
+const BOOL_KEYS = ['fallbackEnabled'];
 const ETFS_MAX = 20;
 const CN_SECID_ONLY = /^[012]\.\d{6}$/;
+const DEMAND_MAX = 400;
+const PROVIDER_KEYS = Object.keys(QUOTE_PROVIDERS);
 
-let SOURCE = { ...QUOTE_SOURCE_DEFAULTS, etfs: [...QUOTE_SOURCE_DEFAULTS.etfs] };
+const cloneSource = (values) => ({ ...values, etfs: [...values.etfs], sourceOrder: [...values.sourceOrder] });
+let SOURCE = cloneSource(QUOTE_SOURCE_DEFAULTS);
 
 export function quoteSource() {
-  return { ...SOURCE, etfs: [...SOURCE.etfs] };
+  return cloneSource(SOURCE);
 }
 
 export const sourceHostOk = (host) => QUOTE_HOSTS.includes(String(host));
 
 // 校验并合并；返回 {values, rejected} 让调用方能把「哪些项被拒」如实说出去
 export function checkQuoteSource(patch = {}) {
-  const values = { ...SOURCE, etfs: [...SOURCE.etfs] };
+  const values = cloneSource(SOURCE);
   const rejected = [];
   for (const key of HOST_KEYS) {
     if (patch[key] === undefined) continue;
@@ -75,6 +88,23 @@ export function checkQuoteSource(patch = {}) {
     if (Number.isFinite(number) && number >= min && number <= max) values[key] = Math.round(number);
     else rejected.push(`${key}：超出允许范围 ${min}–${max}`);
   }
+  for (const key of BOOL_KEYS) {
+    if (patch[key] === undefined) continue;
+    values[key] = patch[key] === true || patch[key] === 'true' || patch[key] === 1;
+  }
+  if (patch.sourceOrder !== undefined) {
+    const list = Array.isArray(patch.sourceOrder) ? patch.sourceOrder : String(patch.sourceOrder).split(',');
+    const clean = [];
+    let bad = false;
+    for (const item of list) {
+      const key = String(item ?? '').trim();
+      if (!PROVIDER_KEYS.includes(key)) { bad = true; continue; }
+      if (!clean.includes(key)) clean.push(key);
+    }
+    if (bad) rejected.push(`sourceOrder：只能填 ${PROVIDER_KEYS.join(' / ')}`);
+    else if (!clean.length) rejected.push('sourceOrder：至少要有一个源');
+    else values.sourceOrder = clean;
+  }
   if (patch.etfs !== undefined) {
     const list = Array.isArray(patch.etfs) ? patch.etfs : String(patch.etfs).split(',');
     const clean = [...new Set(list.map((item) => String(item ?? '').trim()).filter((item) => CN_SECID_ONLY.test(item)))];
@@ -83,192 +113,282 @@ export function checkQuoteSource(patch = {}) {
     else values.etfs = clean;
   }
   for (const key of Object.keys(patch)) {
-    if (HOST_KEYS.includes(key) || SOURCE_LIMITS[key] || key === 'etfs') continue;
+    if (HOST_KEYS.includes(key) || SOURCE_LIMITS[key] || BOOL_KEYS.includes(key) || key === 'etfs' || key === 'sourceOrder') continue;
     rejected.push(`${key}：不是可配置项`);
   }
   return { values, rejected };
 }
 
+// ---- 每个源的运行状态 ----
+// 冷却是这条链能用的关键：没有它，首选源被封时每轮都要先吃一次它的超时，列表一直转圈
+const state = new Map();
+const stateOf = (key) => {
+  if (!state.has(key)) state.set(key, { failStreak: 0, coolUntil: 0, lastError: null, lastOkAt: 0, lastMs: null });
+  return state.get(key);
+};
+
+function markOk(key, ms, nowMs) {
+  const box = stateOf(key);
+  box.failStreak = 0;
+  box.coolUntil = 0;
+  box.lastError = null;
+  box.lastOkAt = nowMs;
+  box.lastMs = ms;
+}
+
+function markFail(key, message, nowMs) {
+  const box = stateOf(key);
+  box.failStreak += 1;
+  box.lastError = String(message ?? 'failed').slice(0, 60);
+  box.coolUntil = nowMs + SOURCE.cooldownMs;
+}
+
+export function quoteProviders() {
+  const nowMs = Date.now();
+  return PROVIDER_KEYS.map((key) => {
+    const provider = QUOTE_PROVIDERS[key];
+    const box = stateOf(key);
+    return {
+      key,
+      label: provider.label,
+      hosts: provider.hosts,
+      caps: Object.entries(provider.caps).filter(([, on]) => on).map(([name]) => name),
+      rank: SOURCE.sourceOrder.indexOf(key),
+      enabled: SOURCE.sourceOrder.includes(key),
+      failStreak: box.failStreak,
+      coolingFor: box.coolUntil > nowMs ? Math.ceil((box.coolUntil - nowMs) / 1000) : 0,
+      lastError: box.lastError,
+      lastOkAt: box.lastOkAt ? new Date(box.lastOkAt).toISOString() : null,
+      lastMs: box.lastMs,
+    };
+  });
+}
+
+// 本轮可用的源，按配置顺序；关掉降级时只留第一个
+function chainOrder(nowMs) {
+  const usable = SOURCE.sourceOrder.filter((key) => QUOTE_PROVIDERS[key]);
+  const list = SOURCE.fallbackEnabled ? usable : usable.slice(0, 1);
+  const skipped = [];
+  const ready = list.filter((key) => {
+    const box = stateOf(key);
+    if (box.coolUntil > nowMs) {
+      skipped.push({ key, label: QUOTE_PROVIDERS[key].label, reason: `冷却中 ${Math.ceil((box.coolUntil - nowMs) / 1000)} 秒 · ${box.lastError ?? '上次失败'}` });
+      return false;
+    }
+    return true;
+  });
+  return { ready, skipped };
+}
+
+// 空返回也算这一家没用：有些接口全挂了却回一个空数组，若当成成功就不会再往下家试
+const isEmptyResult = (cap, value) => {
+  if (value === null || value === undefined) return true;
+  if (Array.isArray(value)) return value.length === 0;
+  if (cap === 'trends') return !Array.isArray(value.points) || value.points.length === 0;
+  if (cap === 'fx') return !Number.isFinite(value.rate);
+  return false;
+};
+
+// 依次尝试：第一个成功的返回值与它的名字，全失败则把每家的错误一起带出去
+async function withChain(cap, args, nowMs) {
+  const { ready, skipped } = chainOrder(nowMs);
+  // 某项能力只有个别源提供时（检索、美股榜只有东财有），冷却不能把它变成「这项没了」：
+  // 宁可多等一次超时，也要保住单源功能——否则东财一被限流，搜索框就直接空掉
+  const capable = SOURCE.sourceOrder.filter((key) => QUOTE_PROVIDERS[key]?.caps[cap]);
+  const queue = ready.filter((key) => QUOTE_PROVIDERS[key]?.caps[cap]).length
+    ? ready
+    : capable;
+  const failures = [];
+  for (const key of queue) {
+    const provider = QUOTE_PROVIDERS[key];
+    if (!provider.caps[cap]) {
+      failures.push({ key, label: provider.label, error: '该源不提供这项能力' });
+      continue;
+    }
+    const started = Date.now();
+    try {
+      const value = await provider[cap](SOURCE, ...args);
+      if (isEmptyResult(cap, value)) {
+        markFail(key, '返回为空', nowMs);
+        failures.push({ key, label: provider.label, error: '返回为空' });
+        continue;
+      }
+      markOk(key, Date.now() - started, nowMs);
+      return { value, provider: key, label: provider.label, fellBack: key !== SOURCE.sourceOrder[0], tried: failures, skipped };
+    } catch (error) {
+      const reason = String(error?.cause?.code ?? error?.message ?? error).slice(0, 60);
+      markFail(key, reason, nowMs);
+      failures.push({ key, label: provider.label, error: reason });
+    }
+  }
+  const thrown = new Error(failures.at(-1)?.error ?? 'all_sources_cooling');
+  thrown.sources = failures;
+  thrown.skipped = skipped;
+  throw thrown;
+}
+
+// 「本轮真正需要定价的代码」：持仓、自选、按代码直查过的标的都记在这里。
+// 美股只有东财有榜，源降级后靠这份清单 + 一份流动股表保证持仓估值与强平判定不瞎。
+const demand = new Set();
+export function rememberDemand(secids) {
+  for (const secid of secids ?? []) {
+    if (typeof secid !== 'string' || secid.length > 20) continue;
+    if (!demand.has(secid) && demand.size >= DEMAND_MAX) demand.delete(demand.values().next().value);
+    demand.delete(secid);
+    demand.add(secid);
+  }
+}
+
+// 代码 → secid 的本地兜底：检索接口不可用时（源降级或限流），用已经加载过的池子与记过的代码来认。
+// 只认完全匹配，不做前缀猜测——猜错交易所会让同一只股票出现两条行情。
+export function secidByCode(code, market = 'cn') {
+  const needle = String(code ?? '').trim().toUpperCase();
+  if (!needle) return null;
+  for (const box of [usSnapshot.data, snapshot.data]) {
+    for (const quote of box?.values?.() ?? []) {
+      if (String(quote.code).toUpperCase() !== needle) continue;
+      if (marketOf(quote.secid) === market) return quote.secid;
+    }
+  }
+  for (const secid of demand) {
+    if (marketOf(secid) !== market) continue;
+    if (splitSecid(secid).code.toUpperCase() === needle) return secid;
+  }
+  return null;
+}
+
+// ---- 缓存 ----
+const FX_FALLBACK = Math.round(6.7 * MICRO);
+let snapshot = { at: 0, day: '', data: null, note: '', provider: '', fellBack: false };
+let usSnapshot = { at: 0, day: '', data: null, note: '', provider: '', fellBack: false };
+let lastError = null;
+let usLastError = null;
+let extraCache = new Map();
+let fxCache = { at: 0, rate: FX_FALLBACK, provider: '', label: '' };
+const charts = new Map();
+const chartFlights = new Map();
+const INDEX_TTL_MS = 6 * 3600_000;
+const INDEX_RETRY_MS = 5 * 60_000;
+let symbolIndex = { at: 0, list: [] };
+
 // 换源或换 TTL 之后必须清缓存，否则「检测」打到的还是旧快照，结论是假的
 function resetCaches() {
-  snapshot = { at: 0, day: '', data: null };
-  usSnapshot = { at: 0, day: '', data: null };
-  fxCache = { at: 0, rate: FX_FALLBACK };
+  snapshot = { at: 0, day: '', data: null, note: '', provider: '', fellBack: false };
+  usSnapshot = { at: 0, day: '', data: null, note: '', provider: '', fellBack: false };
+  lastError = null;
+  usLastError = null;
   extraCache = new Map();
+  fxCache = { at: 0, rate: FX_FALLBACK, provider: '', label: '' };
   charts.clear();
   chartFlights.clear();
   symbolIndex = { at: 0, list: [] };
+  state.clear();
 }
 
 export function setQuoteSource(patch = {}) {
   const { values, rejected } = checkQuoteSource(patch);
-  SOURCE = values;
-  resetCaches();
-  return { source: quoteSource(), rejected };
+  const changed = JSON.stringify(values) !== JSON.stringify(SOURCE);
+  SOURCE = cloneSource(values);
+  // 配置没变就别清缓存：设置表每两秒刷一次，跟着一起清的话，
+  // 快照缓存与「失败源冷却」永远活不过两秒，降级就等于没做
+  if (changed) resetCaches();
+  return { source: quoteSource(), rejected, changed };
 }
 
 export function resetQuoteSource() {
-  SOURCE = { ...QUOTE_SOURCE_DEFAULTS, etfs: [...QUOTE_SOURCE_DEFAULTS.etfs] };
+  SOURCE = cloneSource(QUOTE_SOURCE_DEFAULTS);
   resetCaches();
   return quoteSource();
 }
 
-const clist = (fs, pz, fid, fields) => `https://${SOURCE.listHost}/api/qt/clist/get?pn=1&pz=${pz}&po=1&np=1&fltt=2&invt=2&fid=${fid}&fs=${fs}&fields=${fields}`;
-const singleUrl = (secid, fields) => `https://${SOURCE.singleHost}/api/qt/stock/get?secid=${secid}&fltt=2&invt=2&fields=${fields}`;
-const KLINE_BASE = () => `https://${SOURCE.histHost}/api/qt/stock/kline/get`;
-const TRENDS_BASE = () => `https://${SOURCE.histHost}/api/qt/stock/trends2/get`;
-const SUGGEST_BASE = () => `https://${SOURCE.searchHost}/api/suggest/get`;
+const toMap = (rows) => {
+  const map = new Map();
+  for (const row of rows) if (row && !map.has(row.secid)) map.set(row.secid, row);
+  return map;
+};
 
-const LIST_FIELDS = 'f2,f3,f4,f5,f6,f7,f8,f12,f13,f14,f15,f16,f17,f18,f20,f124';
-const ONE_FIELDS = 'f43,f44,f45,f46,f47,f48,f57,f58,f60,f86,f168,f169,f170,f171';
-
-const num = (v) => (typeof v === 'number' && Number.isFinite(v) ? v : null);
-const micro = (v) => (v === null ? null : Math.round(v * MICRO));
-
-async function getJson(url, ms = SOURCE.timeoutMs) {
-  const response = await fetch(url, {
-    headers: { 'User-Agent': UA, Accept: 'application/json' },
-    signal: AbortSignal.timeout(ms),
-  });
-  if (!response.ok) throw new Error(`upstream_${response.status}`);
-  const body = await response.json();
-  if (!body || typeof body !== 'object') throw new Error('upstream_shape');
-  return body;
+// 一批一批分开容错：某一批挂掉只该少掉那一批，不该把整个市场带走
+async function attempt(cap, args, nowMs) {
+  try {
+    return { status: 'fulfilled', ...(await withChain(cap, args, nowMs)) };
+  } catch (error) {
+    return { status: 'rejected', error };
+  }
 }
 
-function listOf(row, kind) {
-  const market = String(row.f13);
-  const code = String(row.f12);
-  const prevClose = micro(row.f18);
-  const last = micro(row.f2);
-  const name = String(row.f14 ?? '');
-  const secid = secidOf(market, code);
-  return shape(secid, code, name, kind, last, prevClose, micro(row.f17), micro(row.f15), micro(row.f16),
-    num(row.f3), row.f5, row.f6, row.f8, row.f20, row.f124);
-}
+const failureText = (box) => {
+  const list = box?.error?.sources ?? [];
+  return list.length ? list.map((item) => `${item.label}:${item.error}`).join(' ') : String(box?.error?.message ?? 'failed');
+};
 
-function shape(secid, code, name, kind, last, prevClose, open, high, low, pct, volume, amount,
-  turnover, marketCap, ts) {
-  if (!tradableOf(kind) && kind !== 'index') return null;
-  if (last === null || prevClose === null || prevClose <= 0) return null;
-  const limits = limitPricesOf(prevClose, secid, name, kind);
-  return {
-    secid, code, name, kind,
-    last, prevClose, open, high, low,
-    change: last - prevClose,
-    pct: pct ?? (prevClose ? ((last - prevClose) / prevClose) * 100 : 0),
-    volume: num(volume) ?? 0,           // 手
-    amount: Math.round(num(amount) ?? 0), // 元
-    turnover: num(turnover),
-    marketCap: num(marketCap),
-    limitUp: limits.up,
-    limitDown: limits.down,
-    limitRatio: limits.ratio,
-    tick: tickOf(kind, marketOf(secid)),
-    ts: num(ts) ?? 0,
-    // 美股没有每日涨跌停，limits 为 null 时不能参与比较（null 会被强转成 0 而误判涨停）
-    sealedUp: limits.up !== null && last >= limits.up,
-    sealedDown: limits.down !== null && last <= limits.down,
-  };
-}
-
-let snapshot = { at: 0, day: '', data: null, note: '' };
-let extraCache = new Map();
-let lastError = null;
-
-// 三个批次分开容错：单标的接口抖动只会少掉 ETF，不该把整个 A 股池一起带走
-async function fetchSnapshot() {
-  const indices = getJson(clist('b:MK0010', SOURCE.indexPoolSize, 'f3', LIST_FIELDS))
-    .then((body) => (body.data?.diff ?? []).map((r) => listOf(r, 'index')).filter(Boolean));
-  const stocks = getJson(clist('m:1+t:2,m:1+t:23,m:0+t:6,m:0+t:80', SOURCE.cnPoolSize, 'f6', LIST_FIELDS))
-    .then((body) => (body.data?.diff ?? []).map((r) => listOf(r, 'stock')).filter(Boolean));
-  const etfs = Promise.allSettled(SOURCE.etfs.filter((s) => CN_SECID_ONLY.test(s)).map(async (secid) => {
-    const body = await getJson(singleUrl(secid, ONE_FIELDS));
-    const d = body.data;
-    if (!d) return null;
-    const { code } = splitSecid(secid);
-    return shape(secid, String(d.f57 ?? code), String(d.f58 ?? ''), 'etf', micro(d.f43), micro(d.f60),
-      micro(d.f46), micro(d.f44), micro(d.f45), num(d.f170), d.f47, d.f48, d.f168, null, d.f86);
-  }));
-  const [i, s, e] = await Promise.allSettled([indices, stocks, etfs]);
-  const list = [
+// ---- 沪深快照：指数 + 个股榜 + ETF 补价 ----
+async function fetchSnapshot(nowMs) {
+  const [i, s, e] = await Promise.all([
+    attempt('cnIndexes', [], nowMs),
+    attempt('cnStocks', [SOURCE.cnPoolSize], nowMs),
+    attempt('cnEtfs', [SOURCE.etfs.filter((secid) => CN_SECID_ONLY.test(secid))], nowMs),
+  ]);
+  const quotes = toMap([
     ...(i.status === 'fulfilled' ? i.value : []),
     ...(s.status === 'fulfilled' ? s.value : []),
-    ...(e.status === 'fulfilled' ? e.value.filter(Boolean) : []),
-  ];
-  const quotes = new Map();
-  for (const q of list) if (q) quotes.set(q.secid, q);
-  const hard = [i, s].filter((item) => item.status === 'rejected');
+    ...(e.status === 'fulfilled' ? e.value : []),
+  ]);
+  const hard = [i, s].filter((box) => box.status === 'rejected');
   if (quotes.size < 20) {
-    throw new Error(String(hard[0]?.reason?.message ?? 'cn_board_empty').slice(0, 40));
+    const error = new Error((hard.length ? failureText(hard[0]) : 'cn_board_empty').slice(0, 40));
+    error.sources = hard.flatMap((box) => box.error?.sources ?? []);
+    throw error;
   }
-  const etfFailed = e.status === 'rejected'
-    ? SOURCE.etfs.length
-    : (e.value ?? []).filter((item) => item.status === 'rejected').length;
+  const etfFailed = e.status === 'rejected' ? SOURCE.etfs.length : Math.max(0, SOURCE.etfs.length - e.value.length);
   const note = hard.length ? `指数/个股批次失败 ${hard.length} 组`
     : etfFailed ? `ETF 补取失败 ${etfFailed}/${SOURCE.etfs.length} 条` : '';
-  return { quotes, note };
+  const main = s.status === 'fulfilled' ? s : i;
+  return { quotes, note, provider: main.provider ?? '', fellBack: Boolean(main.fellBack) };
+}
+
+// ---- 美股快照：个股榜 + 指数 ----
+async function fetchUsSnapshot(nowMs) {
+  const [s, i] = await Promise.all([
+    attempt('usStocks', [SOURCE.usPoolSize, [...demand]], nowMs),
+    attempt('usIndexes', [], nowMs),
+  ]);
+  const quotes = toMap([...(i.status === 'fulfilled' ? i.value : []), ...(s.status === 'fulfilled' ? s.value : [])]);
+  if (quotes.size < 20) {
+    const error = new Error(failureText(s.status === 'rejected' ? s : i).slice(0, 40) || 'us_board_empty');
+    error.sources = [...(s.error?.sources ?? []), ...(i.error?.sources ?? [])];
+    throw error;
+  }
+  const missing = US_INDEXES.filter(([secid]) => !quotes.has(secid)).map(([secid]) => secid);
+  const note = i.status === 'rejected' ? '指数批次失败（板块池正常）'
+    : missing.length ? `指数缺 ${missing.length}/${US_INDEXES.length} 条` : '';
+  const main = s.status === 'fulfilled' ? s : i;
+  return { quotes, note, provider: main.provider ?? '', fellBack: Boolean(main.fellBack) };
 }
 
 export async function getQuotes(force = false, now = new Date()) {
   const parts = bjParts(now);
-  if (!force && snapshot.data && now.getTime() - snapshot.at < SOURCE.cnTtlMs && snapshot.day === parts.day) {
-    return snapshot.data;
-  }
+  if (!force && snapshot.data && now.getTime() - snapshot.at < SOURCE.cnTtlMs && snapshot.day === parts.day) return snapshot.data;
   try {
-    const { quotes, note } = await fetchSnapshot();
+    const built = await fetchSnapshot(now.getTime());
     lastError = null;
-    snapshot = { at: now.getTime(), day: parts.day, data: quotes, note };
+    snapshot = { at: now.getTime(), day: parts.day, data: built.quotes, note: built.note, provider: built.provider, fellBack: built.fellBack };
     if (extraCache.size > 400) extraCache = new Map();
-    return quotes;
+    return built.quotes;
   } catch (error) {
     lastError = String(error?.message ?? error).slice(0, 60);
-    if (snapshot.data) return snapshot.data; // 上游抖动时回退到上一次快照
+    if (snapshot.data) return snapshot.data; // 全部上游异常时回退到上一次快照
     throw error;
   }
-}
-
-export function quoteStatus() {
-  return { ok: !lastError, note: lastError, partial: snapshot.note || undefined };
-}
-
-// ---- 美股行情：一次板块请求（三大交易所按成交额取前 N）+ 一次指数请求 ----
-export const US_INDEXES = [['100.DJIA', '道琼斯'], ['100.SPX', '标普500'], ['100.NDX', '纳斯达克'], ['100.NDX100', '纳斯达克100']];
-const US_BOARDS = 'm:105,m:106,m:107';
-
-let usSnapshot = { at: 0, day: '', data: null, note: '' };
-let usLastError = null;
-
-// 指数走板块接口的 i: 列表（一次请求拿四条）。
-// 实测单标的接口 stock/get 对美股指数并不总是给数据，板块接口更稳，也少三次连接。
-async function fetchUsSnapshot() {
-  const board = getJson(clist(US_BOARDS, SOURCE.usPoolSize, 'f6', LIST_FIELDS))
-    .then((body) => (body.data?.diff ?? [])
-      .map((row) => listOf(row, usKindFor(`${row.f13}.${row.f12}`, row.f14)))
-      .filter(Boolean));
-  const indexes = getJson(clist(US_INDEXES.map(([secid]) => `i:${secid}`).join(','), US_INDEXES.length, 'f3', LIST_FIELDS))
-    .then((body) => (body.data?.diff ?? [])
-      .map((row) => listOf(row, usKindFor(`${row.f13}.${row.f12}`, row.f14)))
-      .filter(Boolean));
-  const [rows, idx] = await Promise.allSettled([board, indexes]);
-  const quotes = new Map();
-  for (const quote of [...(idx.status === 'fulfilled' ? idx.value : []), ...(rows.status === 'fulfilled' ? rows.value : [])]) {
-    if (quote && !quotes.has(quote.secid)) quotes.set(quote.secid, quote);
-  }
-  if (quotes.size < 20) throw new Error(String(rows.reason?.message ?? idx.reason?.message ?? 'us_board_empty').slice(0, 40));
-  const missing = US_INDEXES.filter(([secid]) => !quotes.has(secid)).map(([secid]) => secid);
-  return { quotes, note: idx.status === 'rejected' ? '指数批次失败（板块池正常）'
-    : missing.length ? `指数缺 ${missing.length}/${US_INDEXES.length} 条` : '' };
 }
 
 export async function getUsQuotes(force = false, now = new Date()) {
   const day = etParts(now).day;
   if (!force && usSnapshot.data && now.getTime() - usSnapshot.at < SOURCE.usTtlMs && usSnapshot.day === day) return usSnapshot.data;
   try {
-    const { quotes, note } = await fetchUsSnapshot();
+    const built = await fetchUsSnapshot(now.getTime());
     usLastError = null;
-    usSnapshot = { at: now.getTime(), day, data: quotes, note };
-    return quotes;
+    usSnapshot = { at: now.getTime(), day, data: built.quotes, note: built.note, provider: built.provider, fellBack: built.fellBack };
+    return built.quotes;
   } catch (error) {
     usLastError = String(error?.message ?? error).slice(0, 60);
     if (usSnapshot.data) return usSnapshot.data;
@@ -276,33 +396,48 @@ export async function getUsQuotes(force = false, now = new Date()) {
   }
 }
 
-// 一次取某个市场的快照，接口层只认这一个入口
 export const quotesFor = (market, force = false, now = new Date()) =>
   (market === 'us' ? getUsQuotes(force, now) : getQuotes(force, now));
-export const quoteStatusFor = (market) => (market === 'us'
-  ? { ok: !usLastError, note: usLastError, partial: usSnapshot.note || undefined }
-  : quoteStatus());
+
+// 状态里带上「现在用的是谁」，顶栏与后台概览共用这一份事实，不再各自猜
+export function quoteStatus(market = 'cn') {
+  const box = market === 'us' ? usSnapshot : snapshot;
+  const error = market === 'us' ? usLastError : lastError;
+  return {
+    ok: !error,
+    note: error,
+    partial: box.note || undefined,
+    source: box.provider ? QUOTE_PROVIDERS[box.provider]?.label ?? box.provider : null,
+    sourceKey: box.provider || null,
+    fellBack: Boolean(box.fellBack),
+  };
+}
+export const quoteStatusFor = (market) => quoteStatus(market === 'us' ? 'us' : 'cn');
 
 // ---- 汇率：美元池折人民币只用于「合计」展示与日结快照合并，绝不参与记账 ----
 // 取不到就用上一个可用值，离线兜底给一个常量，避免整条同步因为汇率失败而停摆。
-const FX_FALLBACK = Math.round(6.7 * MICRO);
-let fxCache = { at: 0, rate: FX_FALLBACK };
-
 export async function getFx(now = new Date()) {
   const at = now.getTime();
-  if (at - fxCache.at < SOURCE.fxTtlMs) return fxCache.rate;
+  if (at - fxCache.at < Math.min(SOURCE.fxTtlMs, 60_000)) return fxCache.rate;
   try {
-    const body = await getJson(singleUrl(FX_SECID, ONE_FIELDS), Math.min(SOURCE.timeoutMs, 3_000));
-    const last = micro(body.data?.f43 ?? null);
+    const out = await withChain('fx', [], at);
+    const rate = out.value?.rate ?? null;
     // 6.67 这类报价按微单位是 6.67e6；越界说明上游换了口径，宁可沿用旧值
-    fxCache = { at, rate: last !== null && last > MICRO && last < 100 * MICRO ? last : fxCache.rate };
+    if (rate !== null && rate > MICRO && rate < 100 * MICRO) {
+      fxCache = { at, rate, provider: out.provider, label: out.value?.label ?? '' };
+    }
   } catch {
-    fxCache = { at, rate: fxCache.rate };
+    fxCache = { ...fxCache, at };
   }
   return fxCache.rate;
 }
 
-// 行情健康度：后台检测页与顶栏降级提示共用这一份事实，不再各自猜
+export const fxSource = () => ({
+  provider: fxCache.provider || null,
+  label: fxCache.label || null,
+  fallback: fxCache.rate === FX_FALLBACK,
+});
+
 export function quoteHealth(market = 'cn', now = new Date()) {
   const cn = market !== 'us';
   const box = cn ? snapshot : usSnapshot;
@@ -327,200 +462,108 @@ export function quoteHealth(market = 'cn', now = new Date()) {
     dataTs: lastTs || null,
     dataAgeMinutes,
     staleWarn: dataAgeMinutes !== null && dataAgeMinutes > SOURCE.staleWarnMinutes,
-    host: cn ? SOURCE.listHost : SOURCE.listHost,
+    source: box.provider || null,
+    sourceLabel: box.provider ? QUOTE_PROVIDERS[box.provider]?.label ?? box.provider : null,
+    fellBack: Boolean(box.fellBack),
+    host: box.provider ? QUOTE_PROVIDERS[box.provider].hosts[0] : SOURCE.listHost,
   };
 }
 
-// ---- 后台「行情源检测」：逐个端点实测，结果直接给结论而不是让人猜 ----
-// URL 构造只在这里出现一份，检测打的和线上撮合用的是同一条路径，结论才有意义。
-export const QUOTE_PROBES = [
-  { key: 'cn_board', label: '沪深板块池', host: () => SOURCE.listHost, note: '按成交额取前 N 只个股，是 A 股撮合与列表的数据来源' },
-  { key: 'us_board', label: '美股板块池', host: () => SOURCE.listHost, note: '纳斯达克/纽交所/AMEX 按成交额取前 N 只' },
-  { key: 'us_index', label: '美股指数', host: () => SOURCE.listHost, note: '道琼斯、标普500、纳斯达克、纳斯达克100' },
-  { key: 'single', label: '单标的快照', host: () => SOURCE.singleHost, note: '持仓与搜索命中的池外标的靠它补价' },
-  { key: 'trends', label: '当日分时', host: () => SOURCE.histHost, note: '分时图与「行情是否新鲜」判定' },
-  { key: 'kline', label: '日 K 线', host: () => SOURCE.histHost, note: '蜡烛图与均线' },
-  { key: 'suggest', label: '代码检索', host: () => SOURCE.searchHost, note: '输入代码或拼音首字母时的联想' },
-  { key: 'fx', label: '汇率 USDCNH', host: () => SOURCE.singleHost, note: '美元池折人民币的合并口径；取不到会退回兜底值' },
-];
+// ---- 后台「行情源检测」：逐源逐能力实测，打的就是线上用的那条代码路径 ----
+const CAP_LABELS = {
+  cnStocks: '沪深个股池', cnIndexes: '沪深指数', cnEtfs: '指数 ETF 补价', usStocks: '美股池', usIndexes: '美股指数',
+  one: '单标的快照', fx: '汇率', trends: '当日分时', kline: '日 K 线', suggest: '代码检索',
+};
+const CAP_NOTES = {
+  cnStocks: 'A 股列表与撮合的主要来源',
+  cnIndexes: '顶部指数条',
+  cnEtfs: '不在榜上的 ETF 靠它进列表',
+  usStocks: '美股列表与撮合的主要来源（只有东财有榜，降级后按持仓与自选补价）',
+  usIndexes: '道琼斯、标普500、纳斯达克、纳斯达克100',
+  one: '持仓与搜索命中的池外标的靠它补价',
+  fx: '美元池折人民币的合并口径；取不到会退回兜底值',
+  trends: '分时图',
+  kline: '蜡烛图与均线',
+  suggest: '输入代码或拼音首字母时的联想',
+};
 
-const probeShape = (key, body) => {
-  const d = body?.data;
-  if (Array.isArray(d?.diff)) {
-    const first = d.diff[0];
-    return { rows: d.diff.length, sample: first ? `${first.f14 ?? ''} ${first.f2 ?? first.f43 ?? ''}` : '', ts: first?.f124 ?? null };
-  }
-  if (Array.isArray(d?.klines)) return { rows: d.klines.length, sample: d.klines.at(-1)?.slice(0, 19) ?? '', ts: null };
-  if (Array.isArray(d?.trends)) return { rows: d.trends.length, sample: d.trends.at(-1)?.slice(0, 21) ?? '', ts: null };
-  // 检索接口的结果不在 data 里，是顶层 QuotationCodeTable
-  const table = body?.QuotationCodeTable?.Data ?? d?.QuotationCodeTable?.Data;
-  if (Array.isArray(table)) return { rows: table.length, sample: table[0]?.QuoteID ?? '', ts: null };
-  if (d && typeof d === 'object') return { rows: 1, sample: `${d.f58 ?? d.name ?? ''} ${d.f43 ?? ''}`, ts: d.f86 ?? null };
-  return { rows: 0, sample: '', ts: null };
+export const QUOTE_PROBES = PROVIDER_KEYS.flatMap((key) => Object.entries(QUOTE_PROVIDERS[key].caps)
+  .filter(([, on]) => on)
+  .map(([cap]) => ({
+    key: `${key}:${cap}`,
+    provider: key,
+    providerLabel: QUOTE_PROVIDERS[key].label,
+    cap,
+    label: CAP_LABELS[cap],
+    note: CAP_NOTES[cap],
+  })));
+
+const probeSample = (cap, value) => {
+  if (cap === 'fx') return { rows: 1, sample: `${((value?.rate ?? 0) / MICRO).toFixed(4)} ${value?.label ?? ''}`.trim(), ts: null };
+  if (cap === 'trends') return { rows: value?.points?.length ?? 0, sample: `${value?.name ?? ''} ${(value?.preClose ?? 0) / MICRO}`, ts: null };
+  if (cap === 'kline') return { rows: value?.length ?? 0, sample: String(value?.at(-1)?.day ?? ''), ts: null };
+  if (cap === 'suggest') return { rows: value?.length ?? 0, sample: `${value?.[0]?.name ?? ''} ${value?.[0]?.secid ?? ''}`.trim(), ts: null };
+  if (cap === 'one') return { rows: value ? 1 : 0, sample: `${value?.name ?? ''} ${(value?.last ?? 0) / MICRO}`, ts: value?.ts ?? null };
+  const list = Array.isArray(value) ? value : [];
+  const first = list[0];
+  return { rows: list.length, sample: first ? `${first.name} ${(first.last / MICRO).toFixed(2)}` : '', ts: first?.ts ?? null };
+};
+
+const probeArgs = (cap) => {
+  if (cap === 'cnStocks') return [Math.min(20, SOURCE.cnPoolSize)];
+  if (cap === 'usStocks') return [Math.min(20, SOURCE.usPoolSize), [...demand].slice(0, 20)];
+  if (cap === 'cnEtfs') return [SOURCE.etfs.slice(0, 4)];
+  if (cap === 'one') return ['1.600519'];
+  if (cap === 'trends') return ['1.600519'];
+  if (cap === 'kline') return ['1.600519', 5];
+  if (cap === 'suggest') return ['600519', 'cn'];
+  return [];
 };
 
 export async function probeQuoteSource(key, now = new Date()) {
   const meta = QUOTE_PROBES.find((item) => item.key === key);
-  const started = now.getTime();
-  const url = {
-    cn_board: () => clist('m:1+t:2,m:1+t:23,m:0+t:6,m:0+t:80', Math.min(20, SOURCE.cnPoolSize), 'f6', LIST_FIELDS),
-    us_board: () => clist(US_BOARDS, Math.min(20, SOURCE.usPoolSize), 'f6', LIST_FIELDS),
-    us_index: () => clist(US_INDEXES.map(([secid]) => `i:${secid}`).join(','), US_INDEXES.length, 'f3', LIST_FIELDS),
-    single: () => singleUrl('1.600519', ONE_FIELDS),
-    trends: () => `${TRENDS_BASE()}?secid=1.600519&fields1=f1,f2,f3,f4,f5,f6,f7,f8&fields2=f51,f53,f56,f58&iscr=0&ndays=1`,
-    kline: () => `${KLINE_BASE()}?secid=1.600519&fields1=f1,f2,f3,f4,f5,f6&fields2=f51,f52,f53,f54,f55,f56&klt=101&fqt=1&lmt=3&end=20500101`,
-    suggest: () => `${SUGGEST_BASE()}?input=${encodeURIComponent('600519')}&type=14&count=3`,
-    fx: () => singleUrl(FX_SECID, ONE_FIELDS),
-  }[key];
-  if (!meta || !url) return { key, ok: false, ms: 0, error: '未知探测项' };
+  if (!meta) return { key, ok: false, ms: 0, error: '未知探测项' };
+  const provider = QUOTE_PROVIDERS[meta.provider];
+  const started = Date.now();
   try {
-    const body = await getJson(url(), Math.max(SOURCE.timeoutMs, 5_000));
-    const shape = probeShape(key, body);
-    return {
-      key, label: meta.label, host: meta.host(), ok: true,
-      ms: Date.now() - started, rows: shape.rows, sample: shape.sample, ts: shape.ts,
-    };
+    const value = await provider[meta.cap](SOURCE, ...probeArgs(meta.cap));
+    const shape = probeSample(meta.cap, value);
+    // 空返回按不可用算：链的降级规则也是这么判的，两边口径必须一致，否则检测页会说谎
+    if (isEmptyResult(meta.cap, value)) {
+      markFail(meta.provider, '返回为空', now.getTime());
+      return { ...meta, host: provider.hosts[0], ok: false, ms: Date.now() - started, rows: 0, error: '返回为空' };
+    }
+    markOk(meta.provider, Date.now() - started, now.getTime());
+    return { ...meta, host: provider.hosts[0], ok: true, ms: Date.now() - started, rows: shape.rows, sample: shape.sample, ts: shape.ts };
   } catch (error) {
-    return {
-      key, label: meta.label, host: meta.host(), ok: false,
-      ms: Date.now() - started, error: String(error?.cause?.code ?? error?.message ?? error).slice(0, 60),
-    };
+    const reason = String(error?.cause?.code ?? error?.message ?? error).slice(0, 60);
+    markFail(meta.provider, reason, now.getTime());
+    return { ...meta, host: provider.hosts[0], ok: false, ms: Date.now() - started, error: reason };
   }
 }
 
-// 搜索建议接口：代码与拼音首字母命中率高，中文名经常返回空，因此再配一份本地标的索引
-const DENY_CLASSIFY = new Set(['Option', 'Futures', 'BkQuot', 'KRX', 'OTCFUND', 'UsStock', 'HKStock']);
-const INDEX_TTL_MS = 6 * 3600_000;
-let symbolIndex = { at: 0, list: [] };
-
-// 全市场代码表：总市值前 1000 名 + 重要指数 + 指数 ETF，够覆盖常见中文检索
-async function buildSymbolIndex() {
-  const rows = [];
-  const pages = [
-    [clist('m:1+t:2,m:1+t:23,m:0+t:6,m:0+t:80', 1_000, 'f20', 'f12,f13,f14'), 'stock'],
-    [clist('b:MK0010', SOURCE.indexPoolSize, 'f3', 'f12,f13,f14'), 'index'],
-  ];
-  for (const [url, kind] of pages) {
-    try {
-      const body = await getJson(url, Math.max(SOURCE.timeoutMs, 6_000));
-      for (const row of body.data?.diff ?? []) {
-        rows.push({ secid: secidOf(String(row.f13), String(row.f12)), code: String(row.f12), name: String(row.f14 ?? ''), kind });
-      }
-    } catch { /* 索引缺失时仍可按代码/拼音检索 */ }
-  }
-  for (const secid of INDEX_ETFS) {
-    const { code } = splitSecid(secid);
-    rows.push({ secid, code, name: code, kind: 'etf' });
-  }
-  return rows;
-}
-
-const CN_SECID = /^[01]\.\d{6}$/;
-const US_SECID = /^(100|105|106|107)\./i;
-
-// 美股没有可靠的 classify 细分返回，用名称判定 ETF：东财的美股 ETF 名字一律带 ETF/做多/做空/杠杆。
-// 市场号 100 是全球指数，一律按不可交易的 index 处理。
-const usKindOf = (name) => (/ETF|杠杆|做多|做空|指(数)?基/i.test(String(name ?? '')) ? 'etf' : 'stock');
-const usKindFor = (secid, name) => (String(secid).startsWith('100.') ? 'index' : usKindOf(name));
-
-export async function searchSymbols(query, quotes, now = new Date(), market = 'cn') {
-  const needle = String(query ?? '').trim().slice(0, 24);
-  if (!needle) return [];
-  const found = new Map();
-  const push = (item) => {
-    if (!item?.secid) return;
-    // 市场隔离：搜美股只给美股代码，搜 A 股仍旧屏蔽境外品种（与原行为一致）
-    if (market === 'us') {
-      if (!US_SECID.test(item.secid)) return;
-    } else if (!CN_SECID.test(item.secid) || (item.classify && DENY_CLASSIFY.has(item.classify))) return;
-    if (!found.has(item.secid)) found.set(item.secid, item);
-  };
-
-  // 已加载的行情池先本地匹配：零成本，且不受上游限制
-  for (const quote of quotes?.values?.() ?? []) {
-    if (quote.name.includes(needle) || quote.code.toUpperCase().startsWith(needle.toUpperCase())) {
-      push({ secid: quote.secid, code: quote.code, name: quote.name, kind: quote.kind });
-    }
-  }
-
-  if (/^[0-9a-zA-Z]+$/.test(needle) || /[一-龥]/.test(needle)) {
-    try {
-      const body = await getJson(`${SUGGEST_BASE()}?input=${encodeURIComponent(needle)}&type=14&count=20`, SOURCE.timeoutMs);
-      for (const row of body.QuotationCodeTable?.Data ?? []) {
-        const secid = String(row.QuoteID ?? '');
-        const classify = String(row.Classify ?? '');
-        push({
-          secid, code: String(row.Code ?? ''), name: String(row.Name ?? ''),
-          kind: market === 'us' ? usKindFor(secid, row.Name)
-            : (classify === 'Index' ? 'index' : classify === 'Fund' ? 'etf' : 'stock'),
-          classify, marketLabel: String(row.SecurityTypeName ?? ''),
-        });
-      }
-    } catch { /* 上游异常时退回本地索引 */ }
-  }
-
-  // 中文检索兜底：A 股侧建议接口对中文名经常空返回，美股侧建议接口中文可用，不需要全表扫描
-  if (market !== 'us' && (/[一-龥]/.test(needle) || found.size < 6)) {
-    if (now.getTime() - symbolIndex.at > INDEX_TTL_MS) {
-      symbolIndex = { at: now.getTime(), list: await buildSymbolIndex() };
-    }
-    for (const item of symbolIndex.list) {
-      if (found.size >= 20) break;
-      if (item.name.includes(needle) || item.code.startsWith(needle)) push({ ...item });
-    }
-  }
-
-  return [...found.values()].slice(0, 20).map((item) => {
-    const live = quotes?.get?.(item.secid);
-    return {
-      ...item,
-      name: live?.name ?? item.name,
-      last: live?.last ?? null,
-      pct: live?.pct ?? null,
-      tradable: item.kind === 'stock' || item.kind === 'etf',
-    };
-  });
-}
-
-// 持仓/下单涉及板块外的标的时，按需补取单标的行情。
-// 注意：美股的单标的接口 stock/get 只覆盖部分代码，实测 clist 的 i:市场.代码 更稳，所以美股走板块接口取一条。
-const US_SYMBOL = /^(100|105|106|107)\.[A-Za-z][A-Za-z0-9.\-]{0,9}$/;
+// ---- 池外标的补价：持仓、自选、按代码直查 ----
+const US_SYMBOL = /^(100|105|106|107)\./i;
 export async function ensureQuote(secid, quotes, now = new Date()) {
-  const known = quotes.get(secid);
+  const known = quotes?.get?.(secid);
   if (known) return known;
   const us = US_SYMBOL.test(secid);
   if (!us && !/^[012]\.\d{6}$/.test(secid)) return null;
+  rememberDemand([secid]);
   const hit = extraCache.get(secid);
   if (hit && now.getTime() - hit.at < (marketOf(secid) === 'us' ? SOURCE.usTtlMs : SOURCE.cnTtlMs)) return hit.quote;
   try {
-    if (us) {
-      const body = await getJson(clist(`i:${secid}`, 3, 'f3', LIST_FIELDS));
-      const row = (body.data?.diff ?? []).find((item) => `${item.f13}.${item.f12}` === secid);
-      if (!row) return null;
-      const quote = listOf(row, usKindFor(secid, row.f14));
-      if (quote) extraCache.set(secid, { at: now.getTime(), quote });
-      return quote;
-    }
-    const body = await getJson(singleUrl(secid, ONE_FIELDS));
-    const d = body.data;
-    if (!d) return null;
-    const { market, code } = splitSecid(secid);
-    const kind = (market === '1' && code[0] === '5') || (market === '0' && code[0] === '1') ? 'etf' : 'stock';
-    const quote = shape(secid, String(d.f57 ?? code), String(d.f58 ?? ''), kind, micro(d.f43), micro(d.f60),
-      micro(d.f46), micro(d.f44), micro(d.f45), num(d.f170), d.f47, d.f48, d.f168, null, d.f86);
-    if (quote) extraCache.set(secid, { at: now.getTime(), quote });
-    return quote;
+    const out = await withChain('one', [secid], now.getTime());
+    if (out.value) extraCache.set(secid, { at: now.getTime(), quote: out.value });
+    return out.value ?? null;
   } catch {
     return null;
   }
 }
 
-// 图表缓存：分时 20 秒、日 K 5 分钟，同标的并发请求合并。
-// 前端会预取悬停与相邻标的，没有这一层就会把上游打爆、把点击拖慢。
-// TTL 走行情源配置，后台可以按上游稳定性调整
+// ---- 图表：分时 20 秒、日 K 5 分钟，同标的并发请求合并 ----
+// 前端会预取悬停与相邻标的，没有这一层就会把上游打爆、把点击拖慢
 const NEGATIVE_TTL = 5_000;
-const charts = new Map();
-const chartFlights = new Map();
 
 function cachedChart(key, ttl, loader) {
   const hit = charts.get(key);
@@ -543,38 +586,85 @@ function cachedChart(key, ttl, loader) {
   return task;
 }
 
-// 当日分时：用于分时图与「行情是否新鲜」的判定
-export function trendsOf(secid) {
-  return cachedChart(`trends:${secid}`, SOURCE.trendsTtlMs, () => fetchTrends(secid));
+export function trendsOf(secid, now = new Date()) {
+  return cachedChart(`trends:${secid}`, SOURCE.trendsTtlMs, async () => (await withChain('trends', [secid], now.getTime())).value);
 }
 
-async function fetchTrends(secid) {
-  const url = `${TRENDS_BASE()}?secid=${secid}&fields1=f1,f2,f3,f4,f5,f6,f7,f8&fields2=f51,f53,f56,f58&iscr=0&ndays=1`;
-  const body = await getJson(url, Math.max(SOURCE.timeoutMs, 5_000));
-  const d = body.data;
-  if (!d || !Array.isArray(d.trends)) return null;
-  return {
-    name: String(d.name ?? ''),
-    preClose: micro(d.preClose),
-    points: d.trends.map((line) => {
-      const [time, price, volume, avg] = String(line).split(',');
-      return { t: time.slice(11, 16), price: micro(Number(price)), volume: Number(volume) || 0, avg: micro(Number(avg)) };
-    }).filter((p) => Number.isFinite(p.price)),
+export function klineOf(secid, count = 120, now = new Date()) {
+  return cachedChart(`kline:${secid}:${count}`, SOURCE.klineTtlMs, async () => (await withChain('kline', [secid, count], now.getTime())).value);
+}
+
+// ---- 检索：建议接口 + 本地代码索引兜底中文名 ----
+const DENY_CLASSIFY = new Set(['Option', 'Futures', 'BkQuot', 'KRX', 'OTCFUND', 'UsStock', 'HKStock']);
+const CN_SECID = /^[01]\.\d{6}$/;
+
+// 全市场代码表：只用来兜底中文名检索。走源链而不是只打东财——东财挂着时也要能搜到「茅台」。
+// 300 条是折中：够用（覆盖常见大盘股与指数成分），又不至于每轮去捞 4600 只。
+const INDEX_RANK_SIZE = 300;
+
+async function buildSymbolIndex(nowMs) {
+  const rows = [];
+  try {
+    const stocks = await withChain('cnStocks', [INDEX_RANK_SIZE], nowMs);
+    for (const quote of stocks.value) rows.push({ secid: quote.secid, code: quote.code, name: quote.name, kind: quote.kind });
+  } catch { /* 索引缺失时仍可按代码/拼音检索 */ }
+  try {
+    const indexes = await withChain('cnIndexes', [], nowMs);
+    for (const quote of indexes.value) rows.push({ secid: quote.secid, code: quote.code, name: quote.name, kind: 'index' });
+  } catch { /* 同上 */ }
+  for (const secid of INDEX_ETFS) rows.push({ secid, code: splitSecid(secid).code, name: '', kind: 'etf' });
+  return rows;
+}
+
+export async function searchSymbols(query, quotes, now = new Date(), market = 'cn') {
+  const needle = String(query ?? '').trim().slice(0, 24);
+  if (!needle) return [];
+  const found = new Map();
+  const push = (item) => {
+    if (!item?.secid) return;
+    // 市场隔离：搜美股只给美股代码，搜 A 股仍旧屏蔽境外品种（与原行为一致）
+    if (market === 'us') {
+      if (!US_SYMBOL.test(item.secid)) return;
+    } else if (!CN_SECID.test(item.secid) || (item.classify && DENY_CLASSIFY.has(item.classify))) return;
+    if (!found.has(item.secid)) found.set(item.secid, item);
   };
-}
 
-// 日 K：用于蜡烛图与均线
-export function klineOf(secid, count = 120) {
-  return cachedChart(`kline:${secid}:${count}`, SOURCE.klineTtlMs, () => fetchKline(secid, count));
-}
+  // 已加载的行情池先本地匹配：零成本，且不受上游限制
+  for (const quote of quotes?.values?.() ?? []) {
+    if (quote.name.includes(needle) || quote.code.toUpperCase().startsWith(needle.toUpperCase())) {
+      push({ secid: quote.secid, code: quote.code, name: quote.name, kind: quote.kind });
+    }
+  }
 
-async function fetchKline(secid, count) {
-  const url = `${KLINE_BASE()}?secid=${secid}&fields1=f1,f2,f3,f4,f5,f6&fields2=f51,f52,f53,f54,f55,f56&klt=101&fqt=1&lmt=${count}&end=20500101`;
-  const body = await getJson(url, Math.max(SOURCE.timeoutMs, 5_000));
-  const d = body.data;
-  if (!d || !Array.isArray(d.klines)) return null;
-  return d.klines.map((line) => {
-    const [day, open, close, high, low, volume] = String(line).split(',');
-    return { day, open: micro(Number(open)), close: micro(Number(close)), high: micro(Number(high)), low: micro(Number(low)), volume: Number(volume) || 0 };
+  if (/^[0-9a-zA-Z]+$/.test(needle) || /[一-龥]/.test(needle)) {
+    try {
+      const out = await withChain('suggest', [needle, market], now.getTime());
+      for (const row of out.value ?? []) push(row);
+    } catch { /* 上游异常时退回本地索引 */ }
+  }
+
+  // 中文检索兜底：建议接口对中文名经常空返回
+  if (market !== 'us' && (/[一-龥]/.test(needle) || found.size < 6)) {
+    if (now.getTime() - symbolIndex.at > INDEX_TTL_MS) {
+      const list = await buildSymbolIndex(now.getTime());
+      // 空索引不缓存六小时：否则一次上游抖动就把中文检索锁死一整个上午，5 分钟后再试
+      if (list.length) symbolIndex = { at: now.getTime(), list };
+      else symbolIndex = { at: now.getTime() - INDEX_TTL_MS + INDEX_RETRY_MS, list: symbolIndex.list };
+    }
+    for (const item of symbolIndex.list) {
+      if (found.size >= 20) break;
+      if (item.name.includes(needle) || item.code.startsWith(needle)) push({ ...item });
+    }
+  }
+
+  return [...found.values()].slice(0, 20).map((item) => {
+    const live = quotes?.get?.(item.secid);
+    return {
+      ...item,
+      name: live?.name ?? item.name,
+      last: live?.last ?? null,
+      pct: live?.pct ?? null,
+      tradable: item.kind === 'stock' || item.kind === 'etf',
+    };
   });
 }

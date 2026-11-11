@@ -192,6 +192,8 @@ export function MarketPanel({ board, selected, held, watch, watchQuotes, filter,
   const sourceBad = Boolean(board?.status && !board.status.ok);
   // 上游只挂掉一部分时（比如单标的接口抖动）池子仍然可用，用更轻的一条话说明降级了什么
   const sourcePartial = board?.status?.partial ?? '';
+  const sourceName = board?.status?.source ?? '';
+  const sourceFellBack = Boolean(board?.status?.fellBack);
 
   return (
     <div className="panel flex h-full flex-col overflow-hidden">
@@ -240,6 +242,11 @@ export function MarketPanel({ board, selected, held, watch, watchQuotes, filter,
             </>
           )}
           {sourceBad && <span className="shrink-0 rounded bg-up/15 px-1.5 text-up">行情源异常，显示上次快照</span>}
+          {!sourceBad && sourceFellBack && (
+            <span className="shrink-0 rounded bg-warn/15 px-1.5 text-warn" title="首选行情源取不到，已自动改用它；字段口径逐项实测一致">
+              已降级到 {sourceName || '备用源'}
+            </span>
+          )}
           {!sourceBad && sourcePartial && <span className="shrink-0 rounded bg-warn/15 px-1.5 text-warn">行情部分降级 · {sourcePartial}</span>}
         </div>
       )}

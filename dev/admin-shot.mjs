@@ -25,6 +25,8 @@ const child = spawn(process.execPath, ['server/index.mjs'], {
   env: {
     ...process.env, PORT: String(port), HOST: '127.0.0.1',
     DB_DRIVER: 'sqlite', DB_PATH: join(dir, 'a.db'), ADMIN_USERNAMES: 'shot_boss',
+    // 备份页会真的覆盖一次，导入前快照必须落在临时目录，不能进 data/backups
+    BACKUP_DIR: join(dir, 'backups'),
   },
   stdio: ['ignore', 'pipe', 'pipe'],
 });
@@ -71,9 +73,9 @@ try {
   await page.screenshot({ path: join(OUT, 'admin-settings.png') });
 
   await page.getByRole('tab', { name: '行情源' }).click();
-  await page.waitForFunction(() => document.body.innerText.includes('立即检测八个端点'), null, { timeout: 12_000 });
+  await page.waitForFunction(() => /立即检测 \d+ 项/.test(document.body.innerText), null, { timeout: 12_000 });
   await page.screenshot({ path: join(OUT, 'admin-quote.png') });
-  await page.getByRole('button', { name: '立即检测八个端点' }).click();
+  await page.getByRole('button', { name: /立即检测 \d+ 项/ }).click();
   await page.waitForFunction(() => document.querySelectorAll('table tbody tr').length >= 8, null, { timeout: 60_000 });
   await page.screenshot({ path: join(OUT, 'admin-quote-check.png') });
 
@@ -90,6 +92,36 @@ try {
   await page.getByRole('tab', { name: '审计' }).click();
   await page.waitForFunction(() => document.querySelectorAll('tbody tr').length >= 1, null, { timeout: 8_000 });
   await page.screenshot({ path: join(OUT, 'admin-audit.png') });
+
+  // 备份页：导出 → 下载 → 回传 → 预检 → 真的覆盖一次（这个库是临时库，可以随便折腾）
+  await page.getByRole('tab', { name: '备份' }).click();
+  await page.waitForFunction(() => document.body.innerText.includes('生成导出'), null, { timeout: 10_000 });
+  await page.screenshot({ path: join(OUT, 'admin-backup-empty.png') });
+
+  await page.getByRole('button', { name: '生成导出' }).click();
+  await page.waitForFunction(() => document.body.innerText.includes('checksum'), null, { timeout: 20_000 });
+  const backupPath = join(dir, 'shot-backup.json');
+  const [download] = await Promise.all([
+    page.waitForEvent('download', { timeout: 20_000 }),
+    page.getByRole('button', { name: '下载 JSON' }).click(),
+  ]);
+  await download.saveAs(backupPath);
+  await page.screenshot({ path: join(OUT, 'admin-backup-export.png') });
+
+  await page.setInputFiles('input[type=file]', backupPath);
+  await page.waitForFunction(() => document.body.innerText.includes('预检'), null, { timeout: 10_000 });
+  await page.getByRole('button', { name: '预检', exact: true }).click();
+  await page.waitForFunction(() => document.body.innerText.includes('校验通过'), null, { timeout: 25_000 });
+  await page.screenshot({ path: join(OUT, 'admin-backup-preview.png') });
+
+  const prefix = await page.evaluate(() => document.body.innerText.match(/checksum\s+([0-9a-f]{12})/)?.[1]?.slice(0, 6) ?? '');
+  await page.getByLabel('校验和前 6 位').fill(prefix);
+  await page.getByRole('button', { name: '确认覆盖全站' }).click();
+  await page.getByRole('button', { name: '再点一次执行覆盖' }).click();
+  await page.waitForFunction(() => document.body.innerText.includes('导入前快照'), null, { timeout: 30_000 });
+  await page.getByText('导入前快照').scrollIntoViewIfNeeded();
+  await page.waitForTimeout(400);
+  await page.screenshot({ path: join(OUT, 'admin-backup-applied.png') });
 
   await page.setViewportSize({ width: 390, height: 844 });
   await page.waitForTimeout(700);

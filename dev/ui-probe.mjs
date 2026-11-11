@@ -23,7 +23,7 @@ const dir = mkdtempSync(join(tmpdir(), 'mkt-probe-'));
 const port = await freePort();
 const child = spawn(process.execPath, ['server/index.mjs'], {
   cwd: ROOT,
-  env: { ...process.env, PORT: String(port), HOST: '127.0.0.1', DB_DRIVER: 'sqlite', DB_PATH: join(dir, 'probe.db') },
+  env: { ...process.env, PORT: String(port), HOST: '127.0.0.1', DB_DRIVER: 'sqlite', DB_PATH: join(dir, 'probe.db'), BACKUP_DIR: join(dir, 'backups') },
   stdio: ['ignore', 'pipe', 'pipe'],
 });
 child.stdout.on('data', () => {});
@@ -42,12 +42,14 @@ try {
   }
   ok('server-up', up, base);
 
-  // 上游拒连时每条断言都会变成超时，先把「行情源不可用」和「探针本身失败」分开说清楚
+  // 上游拒连时每条断言都会变成超时，先把「行情源不可用」和「探针本身失败」分开说清楚。
+  // 注意 board 在取不到行情时仍回 ok:true（只是池子为空），所以闸门看的是行数而不是 ok。
   const quoteGate = await fetch(`${base}/functions/v1/app?action=board`, {
     method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}',
-  }).then((r) => r.json()).catch(() => ({ ok: false, code: 'probe_fetch_failed' }));
-  if (!quoteGate.ok) {
-    console.log(`FAIL 行情源不可用 — ${quoteGate.code} ${String(quoteGate.message ?? '').slice(0, 60)}`);
+  }).then((r) => r.json()).catch(() => ({ market: null }));
+  const pool = quoteGate?.market?.stocks?.length ?? 0;
+  if (pool < 20) {
+    console.log(`FAIL 行情源不可用 — 个股池只有 ${pool} 条${quoteGate?.market?.status?.note ? ` · ${quoteGate.market.status.note}` : ''}`);
     console.log('探针未运行：以下断言全部依赖真实行情列表。稍后重试，或用后台「行情源」页逐项探测定位。');
     child.kill();
     process.exit(2);

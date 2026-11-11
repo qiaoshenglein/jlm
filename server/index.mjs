@@ -3,9 +3,10 @@
 import { createServer } from 'node:http';
 import { readFile, stat } from 'node:fs/promises';
 import { networkInterfaces } from 'node:os';
-import { dirname, extname, normalize, resolve, sep } from 'node:path';
+import { dirname, extname, join, normalize, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createDb } from './db.mjs';
+import { createBackupFiles } from './backups.mjs';
 import { handle } from '../functions/api.mjs';
 import { Store } from '../functions/store.mjs';
 import { adminNames, ensureAdmins } from '../functions/admin.mjs';
@@ -27,6 +28,11 @@ const WEB_DIR = resolve(ROOT, process.env.WEB_DIR ?? 'dist');
 const HOST = flag('host') ?? process.env.HOST ?? '127.0.0.1';
 const PORT = Number(flag('port') ?? process.env.PORT ?? 8787);
 const MAX_BODY = 16 * 1024;
+// 备份导入要把整库 JSON 发上来，只有这两个动作放开请求体上限（其余仍按 16 KB）
+const BACKUP_ACTIONS = new Set(['admin_backup_preview', 'admin_backup_apply']);
+const MAX_IMPORT_BODY = Math.max(MAX_BODY, Number(process.env.BACKUP_MAX_MB ?? 24) * 1024 * 1024);
+const BACKUP_DIR = resolve(ROOT, process.env.BACKUP_DIR ?? join('data', 'backups'));
+const BACKUP_KEEP = Math.max(1, Number(process.env.BACKUP_KEEP ?? 10));
 
 const MIME = {
   '.html': 'text/html; charset=utf-8',
@@ -67,6 +73,10 @@ if (process.env.DB_AUTO_MIGRATE !== '0') {
 
 const log = (line) => console.log(new Date().toISOString(), line);
 
+// 导入前快照：整库覆盖是唯一的不可逆操作，落不下去就不允许执行。
+// 只保留最近 BACKUP_KEEP 份，目录由 BACKUP_DIR 指定（默认 data/backups）。
+const backupFiles = createBackupFiles({ dir: BACKUP_DIR, keep: BACKUP_KEEP });
+
 // 后台引导：ADMIN_USERNAMES 里已注册的账户立刻标为 admin；还没注册的，等其注册后由首次后台请求补上
 const adminBoot = await ensureAdmins(new Store(db));
 
@@ -79,14 +89,15 @@ function notFound(res) {
   send(res, 404, JSON.stringify({ ok: false, code: 'not_found' }), { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
 }
 
-async function readBody(req) {
+async function readBody(req, limit) {
   const chunks = [];
   let size = 0;
   for await (const chunk of req) {
     size += chunk.length;
-    if (size > MAX_BODY) {
+    if (size > limit) {
       const error = new Error('payload_too_large');
       error.status = 413;
+      error.limit = limit;
       throw error;
     }
     chunks.push(chunk);
@@ -97,11 +108,15 @@ async function readBody(req) {
 async function serveApi(req, res, url) {
   const started = Date.now();
   let body;
+  // 备份的两个动作放开到 MAX_IMPORT_BODY，其余仍按 16 KB——大请求体只该出现在这一处
+  const limit = BACKUP_ACTIONS.has(url.searchParams.get('action') ?? '') ? MAX_IMPORT_BODY : MAX_BODY;
   try {
-    body = req.method === 'GET' || req.method === 'HEAD' ? Buffer.alloc(0) : await readBody(req);
+    body = req.method === 'GET' || req.method === 'HEAD' ? Buffer.alloc(0) : await readBody(req, limit);
   } catch (error) {
-    send(res, error.status ?? 400, JSON.stringify({ ok: false, code: 'body_invalid' }),
-      { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
+    send(res, error.status ?? 400, JSON.stringify({
+      ok: false, code: 'payload_too_large',
+      message: error.limit ? `请求体超过 ${Math.round(error.limit / 1024 / 1024)} MB 上限，整库恢复请改用命令行：node scripts/backup.mjs import <文件>` : '请求体无法解析。',
+    }), { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
     return;
   }
   try {
@@ -110,7 +125,7 @@ async function serveApi(req, res, url) {
       headers: new Headers(req.headers),
       body: body.length ? body : undefined,
     });
-    const response = await handle({ request, supabase: db });
+    const response = await handle({ request, supabase: db, files: backupFiles });
     const payload = Buffer.from(await response.arrayBuffer());
     const headers = { 'cache-control': 'no-store' };
     response.headers.forEach((value, key) => {
@@ -159,7 +174,8 @@ const server = createServer(async (req, res) => {
 });
 
 server.headersTimeout = 20_000;
-server.requestTimeout = 30_000;
+// 整库导入的请求体可以到几十 MB，慢链路上传完一分钟是合理预期；其余接口自己会超时
+server.requestTimeout = Math.max(30_000, Number(process.env.REQUEST_TIMEOUT_MS ?? 120_000));
 
 const listenUrls = () => {
   if (HOST !== '0.0.0.0' && HOST !== '::') return [`http://${HOST}:${PORT}`];
@@ -173,6 +189,7 @@ server.listen(PORT, HOST, async () => {
   const hasWeb = Boolean(await stat(WEB_DIR).catch(() => null));
   log(`镜盘已启动：${listenUrls().join('  ')} 数据驱动=${db.driver}${migrated ? ` 已应用 ${migrated}` : ' 跳过建表'}`);
   log(`静态目录 ${WEB_DIR}${hasWeb ? '' : ' —— 不存在，请先执行 npm run build'}`);
+  log(`备份目录 ${BACKUP_DIR} · 导入请求体上限 ${Math.round(MAX_IMPORT_BODY / 1024 / 1024)}MB · 快照保留 ${BACKUP_KEEP} 份`);
   log(adminBoot.configured
     ? `后台已启用：管理员 ${adminNames().join('、')}${adminBoot.justGranted.length ? `（本次新授予 ${adminBoot.justGranted.join('、')}）` : ''} · 入口 #/admin`
     : '后台未启用：设置环境变量 ADMIN_USERNAMES=你的用户名 后再启动即可开启');

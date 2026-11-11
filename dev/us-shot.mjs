@@ -24,6 +24,7 @@ const child = spawn(process.execPath, ['server/index.mjs'], {
   env: {
     ...process.env, PORT: String(port), HOST: '127.0.0.1',
     DB_DRIVER: 'sqlite', DB_PATH: join(dir, 'us.db'), ADMIN_USERNAMES: 'us_boss',
+    BACKUP_DIR: join(dir, 'backups'),
   },
   stdio: ['ignore', 'pipe', 'pipe'],
 });

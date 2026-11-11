@@ -22,7 +22,7 @@ const dir = mkdtempSync(join(tmpdir(), 'mkt-shot-'));
 const port = await freePort();
 const child = spawn(process.execPath, ['server/index.mjs'], {
   cwd: ROOT,
-  env: { ...process.env, PORT: String(port), HOST: '127.0.0.1', DB_DRIVER: 'sqlite', DB_PATH: join(dir, 's.db') },
+  env: { ...process.env, PORT: String(port), HOST: '127.0.0.1', DB_DRIVER: 'sqlite', DB_PATH: join(dir, 's.db'), BACKUP_DIR: join(dir, 'backups') },
   stdio: ['ignore', 'pipe', 'pipe'],
 });
 child.stdout.on('data', () => {});
