@@ -6,12 +6,13 @@ import {
   type Market,
 } from '../format';
 
-type Tab = 'overview' | 'users' | 'orders' | 'settings' | 'audit';
+type Tab = 'overview' | 'users' | 'orders' | 'settings' | 'quote' | 'audit';
 const TABS: { key: Tab; label: string }[] = [
   { key: 'overview', label: '概览' },
   { key: 'users', label: '账户' },
   { key: 'orders', label: '流水' },
   { key: 'settings', label: '参数' },
+  { key: 'quote', label: '行情源' },
   { key: 'audit', label: '审计' },
 ];
 
@@ -31,6 +32,11 @@ type Overview = {
   stats: Stats; settings: Settings; recent: AuditRow[];
   params: Desk['lines']; usParams: Desk['lines']; breakers?: Record<Market, boolean>;
   risk: { belowCall: number; belowLiquid: number; leveraged: number };
+  quote?: {
+    source: string; lastCheck: LastCheck | null;
+    cn: { ok: boolean; fresh: boolean; rows: number; note: string | null; partial: string; dataAgeMinutes: number | null; staleWarn: boolean };
+    us: { ok: boolean; fresh: boolean; rows: number; note: string | null; partial: string; dataAgeMinutes: number | null; staleWarn: boolean };
+  };
 };
 type OrderRow = {
   id: string; who: string; secid: string; code: string; name: string; side: string; qty: number; status: string;
@@ -44,6 +50,52 @@ type Row = {
   ret: number | null; ratio: number | null;
 };
 type AuditRow = { id: string; actor: string | null; action: string; target: string | null; detail: string | null; created_at: string };
+
+type QuoteSource = {
+  listHost: string; singleHost: string; histHost: string; searchHost: string;
+  timeoutMs: number; cnTtlMs: number; usTtlMs: number; fxTtlMs: number;
+  trendsTtlMs: number; klineTtlMs: number; cnPoolSize: number; usPoolSize: number; indexPoolSize: number;
+  etfs: string[]; staleWarnMinutes: number;
+};
+type QuoteHealth = {
+  market: string; ok: boolean; fresh: boolean; rows: number; note: string | null; partial: string;
+  ageMs: number | null; ttlMs: number; day: string; today: string; dataTs: number | null;
+  dataAgeMinutes: number | null; staleWarn: boolean; host: string;
+};
+type QuoteStatus = {
+  source: QuoteSource; defaults: QuoteSource; hosts: string[];
+  probes: { key: string; label: string; note: string }[];
+  health: { cn: QuoteHealth; us: QuoteHealth }; fx: number; lastCheck: LastCheck | null;
+};
+type ProbeRow = {
+  key: string; label?: string; host?: string; ok: boolean; ms: number;
+  rows?: number; sample?: string; ts?: number | null; error?: string;
+};
+type LastCheck = { at: string; verdict: string; okCount: number; total: number; slowest: number };
+type QuoteCheck = {
+  results: ProbeRow[]; verdict: 'ok' | 'partial' | 'down'; okCount: number; total: number;
+  health: { cn: QuoteHealth; us: QuoteHealth }; advice: string[]; source: QuoteSource; checkedAt: string;
+};
+
+// 数值项的展示顺序与说明；边界值由服务端校验，这里只负责写清楚每一项在管什么
+const SOURCE_FIELDS: { key: keyof QuoteSource; label: string; hint: string }[] = [
+  { key: 'timeoutMs', label: '上游超时', hint: '毫秒，单次请求最长等待' },
+  { key: 'cnTtlMs', label: '沪深快照间隔', hint: '毫秒，越小越新但越吃上游' },
+  { key: 'usTtlMs', label: '美股快照间隔', hint: '毫秒' },
+  { key: 'fxTtlMs', label: '汇率缓存', hint: '毫秒，只影响折算展示' },
+  { key: 'trendsTtlMs', label: '分时缓存', hint: '毫秒' },
+  { key: 'klineTtlMs', label: '日 K 缓存', hint: '毫秒' },
+  { key: 'cnPoolSize', label: '沪深个股池', hint: '按成交额取前 N 只' },
+  { key: 'usPoolSize', label:  '美股池', hint: '三个交易所合起来取前 N 只' },
+  { key: 'indexPoolSize', label: '指数池', hint: '条数' },
+  { key: 'staleWarnMinutes', label: '数据落后告警', hint: '分钟，只影响检测结论' },
+];
+const HOST_FIELDS: { key: keyof QuoteSource; label: string; hint: string }[] = [
+  { key: 'listHost', label: '板块接口域名', hint: '沪深与美股池、美股指数都走它' },
+  { key: 'singleHost', label: '单标的域名', hint: '池外标的补价与汇率' },
+  { key: 'histHost', label: '历史接口域名', hint: '分时与日 K' },
+  { key: 'searchHost', label: '检索接口域名', hint: '代码联想' },
+];
 
 const ACTION_LABEL: Record<string, string> = {
   admin_freeze: '冻结账户', admin_unfreeze: '解冻账户', admin_unlock: '解除登录锁定',
@@ -97,6 +149,10 @@ export function Admin({ onExit }: { onExit: () => void }) {
   const [draft, setDraft] = useState<Settings | null>(null);
   const [defaults, setDefaults] = useState<{ cn: Desk; us: Desk } | null>(null);
   const [paramMarket, setParamMarket] = useState<Market>('cn');
+  const [quote, setQuote] = useState<QuoteStatus | null>(null);
+  const [quoteDraft, setQuoteDraft] = useState<QuoteSource | null>(null);
+  const [check, setCheck] = useState<QuoteCheck | null>(null);
+  const [checking, setChecking] = useState(false);
   const [loading, setLoading] = useState(false);
   const timer = useRef(0);
 
@@ -124,6 +180,11 @@ export function Admin({ onExit }: { onExit: () => void }) {
         setDefaults({ cn: result.defaults.params, us: result.defaults.us_params });
       }
       if (which === 'audit') setAudit((await api<{ rows: AuditRow[] }>('admin_audit', { limit: 120 })).rows);
+      if (which === 'quote') {
+        const result = await api<QuoteStatus>('admin_quote_status');
+        setQuote(result);
+        setQuoteDraft(result.source);
+      }
     } catch (error) {
       toast.error(error instanceof ApiError ? error.message : '后台数据读取失败');
     } finally {
@@ -463,6 +524,122 @@ export function Admin({ onExit }: { onExit: () => void }) {
           </div>
         ) : <Empty text="参数加载中…" />)}
 
+        {tab === 'quote' && (quote && quoteDraft ? (
+          <div className="flex flex-col gap-3 text-sm">
+            <div className="grid gap-2 sm:grid-cols-2">
+              <HealthCard item={quote.health.cn} fx={quote.fx} />
+              <HealthCard item={quote.health.us} fx={quote.fx} />
+            </div>
+
+            <section className="rounded border border-hairline bg-raised p-3">
+              <div className="flex flex-wrap items-center gap-2">
+                <MiniButton armedKey="" pending="" text="立即检测八个端点" kind="primary"
+                  onFire={async () => {
+                    setChecking(true);
+                    try {
+                      setCheck(await api<QuoteCheck>('admin_quote_check'));
+                      toast.success('检测完成');
+                    } catch (error) {
+                      toast.error(error instanceof ApiError ? error.message : '检测失败');
+                    } finally {
+                      setChecking(false);
+                    }
+                  }} />
+                {checking && <span className="text-[0.75rem] text-ink-dim">探测中…</span>}
+                {check && (
+                  <span className={`chip num ${check.verdict === 'ok' ? 'border-down/40 bg-down/12 text-down'
+                    : check.verdict === 'partial' ? 'border-warn/50 bg-warn/12 text-warn' : 'border-up/45 bg-up/12 text-up'}`}>
+                    {check.verdict === 'ok' ? '全部可用' : check.verdict === 'partial' ? '部分可用' : '全部不可用'}
+                    {' '}{check.okCount}/{check.total} · 最慢 {Math.max(...check.results.map((row) => row.ms), 0)}ms
+                  </span>
+                )}
+                {quote.lastCheck && !check && (
+                  <span className="num text-[0.6875rem] text-ink-dim">上次检测 {clockTime(quote.lastCheck.at)} · {quote.lastCheck.okCount}/{quote.lastCheck.total} 可用</span>
+                )}
+                <span className="ml-auto text-[0.6875rem] text-ink-dim">检测会真实请求上游，每分钟最多 12 次</span>
+              </div>
+
+              {check && (
+                <div className="mt-3 overflow-x-auto">
+                  <table className="w-full min-w-[46rem] border-collapse text-[0.8125rem]">
+                    <thead>
+                      <tr className="border-b border-hairline text-left text-[0.6875rem] text-ink-dim">
+                        {['端点', '结果', '耗时', '域名', '条数', '样本', '说明'].map((head) => <th key={head} className="px-2 py-1 font-normal">{head}</th>)}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {check.results.map((row) => (
+                        <tr key={row.key} className="border-b border-hairline/40">
+                          <td className="px-2 py-1.5">{row.label ?? row.key}</td>
+                          <td className="px-2"><Badge text={row.ok ? '可用' : '不可用'} kind={row.ok ? 'down' : 'up'} /></td>
+                          <td className={`num px-2 text-right ${row.ms > 1500 ? 'text-warn' : ''}`}>{row.ms}ms</td>
+                          <td className="num px-2 text-[0.75rem] text-ink-dim">{row.host ?? '—'}</td>
+                          <td className="num px-2 text-right">{row.rows ?? '—'}</td>
+                          <td className="num max-w-[16rem] truncate px-2 text-[0.75rem] text-ink-dim" title={row.sample ?? ''}>{row.sample || '—'}</td>
+                          <td className="max-w-[18rem] truncate px-2 text-[0.75rem] text-up" title={row.error ?? ''}>{row.error || '—'}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                  {check.advice.length > 0 && (
+                    <ul className="mt-2 space-y-1 text-[0.75rem] leading-5 text-ink-dim">
+                      {check.advice.map((line) => <li key={line} className="border-l border-warn/50 pl-2">{line}</li>)}
+                    </ul>
+                  )}
+                </div>
+              )}
+            </section>
+
+            <p className="text-[0.75rem] leading-6 text-ink-dim">
+              域名只能从实测可用的清单里选：本运行时按 UTF-8 解 JSON，换成腾讯 / 新浪这类 GBK 源会整片乱码；
+              而允许填任意主机等于给服务端开一个内网探测口。保存后缓存立即清空，下一次同步就用新配置，不用重启。
+            </p>
+
+            <section>
+              <h3 className="mb-1.5 text-[0.6875rem] tracking-[0.08em] text-primary">接口域名</h3>
+              <div className="grid gap-2 sm:grid-cols-2">
+                {HOST_FIELDS.map((field) => (
+                  <label key={field.key} className="flex items-center justify-between gap-3 rounded border border-hairline bg-raised px-3 py-2 text-xs">
+                    <span>{field.label}<span className="block text-[0.6875rem] text-ink-dim">{field.hint}</span></span>
+                    <select value={String(quoteDraft[field.key])} aria-label={field.label}
+                      onChange={(event) => setQuoteDraft({ ...quoteDraft, [field.key]: event.target.value })}
+                      className="num h-8 max-w-[15rem] rounded border border-hairline bg-panel px-1 text-[0.75rem] outline-none focus:border-input">
+                      {quote.hosts.map((host) => <option key={host} value={host}>{host}</option>)}
+                    </select>
+                  </label>
+                ))}
+              </div>
+            </section>
+
+            <section>
+              <h3 className="mb-1.5 text-[0.6875rem] tracking-[0.08em] text-primary">节奏与池子</h3>
+              <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
+                {SOURCE_FIELDS.map((field) => (
+                  <Field key={field.key} label={field.label} hint={field.hint}
+                    value={Number(quoteDraft[field.key] ?? 0)}
+                    onChange={(value) => setQuoteDraft({ ...quoteDraft, [field.key]: Math.round(value) })} />
+                ))}
+              </div>
+            </section>
+
+            <label className="flex flex-col gap-1.5 rounded border border-hairline bg-raised px-3 py-2 text-xs">
+              <span>指数 ETF 池<span className="ml-1 text-[0.6875rem] text-ink-dim">逗号分隔的 secid，最多 20 条；这些标的逐个补价，不在板块池里也能进列表</span></span>
+              <input value={quoteDraft.etfs.join(', ')} aria-label="指数 ETF 池"
+                onChange={(event) => setQuoteDraft({ ...quoteDraft, etfs: event.target.value.split(/[,，\s]+/).filter(Boolean) })}
+                className="num h-8 rounded border border-hairline bg-panel px-2 text-[0.75rem] outline-none focus:border-input" />
+              <span className="num text-[0.6875rem] text-ink-dim">当前 {quoteDraft.etfs.length} 条 · 默认 {quote.defaults.etfs.length} 条</span>
+            </label>
+
+            <div className="flex flex-wrap items-center gap-2">
+              <MiniButton armedKey="quote-save" pending={pending} text="保存行情源配置" armed="确认保存" kind="primary"
+                onFire={() => act('quote-save', () => api('admin_settings', { patch: { quote_source: quoteDraft }, confirm: true }), '行情源配置已保存并立即生效')} />
+              <MiniButton armedKey="quote-reset" pending={pending} text="恢复默认配置" armed="确认恢复"
+                onFire={() => act('quote-reset', () => api('admin_settings', { patch: { quote_source: quote.defaults }, confirm: true }), '已恢复默认行情源配置')} />
+              <span className="text-[0.6875rem] text-ink-dim">保存与恢复都写入审计（含变更项对照）</span>
+            </div>
+          </div>
+        ) : <Empty text="行情源加载中…" />)}
+
         {tab === 'audit' && (audit === null ? <Empty text="审计加载中…" /> : audit.length === 0 ? <Empty text="还没有后台操作记录" /> : (
           <div className="overflow-x-auto">
             <table className="w-full min-w-[44rem] border-collapse text-[0.8125rem]">
@@ -492,6 +669,22 @@ export function Admin({ onExit }: { onExit: () => void }) {
 
 function OverviewPane({ data }: { data: Overview }) {
   const breakers = data.breakers ?? { cn: data.settings.match_paused, us: false };
+  const q = data.quote;
+  const quoteState = !q
+    ? { label: '未取数', hint: '打开「行情源」页检测', className: 'text-ink-dim' }
+    : (() => {
+      const down = !q.cn.ok && !q.cn.rows && !q.us.ok && !q.us.rows;
+      const stale = !q.cn.fresh || !q.us.fresh;
+      const degraded = Boolean(q.cn.partial || q.us.partial);
+      return {
+        label: down ? '取不到' : degraded ? '部分降级' : stale ? '非当日' : '正常',
+        hint: `沪深 ${q.cn.rows} 条 · 美股 ${q.us.rows} 条`
+          + (q.cn.note || q.us.note ? ` · 上游错误 ${q.cn.note ?? q.us.note}` : '')
+          + (down ? ' · 去「行情源」页逐项定位'
+            : q.lastCheck ? ` · 上次检测 ${q.lastCheck.okCount}/${q.lastCheck.total} 可用` : ''),
+        className: down ? 'text-up' : stale || degraded ? 'text-warn' : 'text-down',
+      };
+    })();
   const cards: { label: string; value: string; hint?: string; className?: string }[] = [
     { label: '账户总数', value: `${data.accounts}`, hint: `今日新增 ${data.newToday} · 今日活跃 ${data.activeToday}` },
     { label: '管理员', value: `${data.admins}`, hint: data.locked > 0 ? `${data.locked} 个账户处于登录锁定` : '无登录锁定' },
@@ -511,6 +704,10 @@ function OverviewPane({ data }: { data: Overview }) {
     {
       label: '注册', value: data.settings.register_enabled ? '开放' : '已关闭',
       hint: data.settings.invite_code ? '需要邀请码' : '无需邀请码', className: data.settings.register_enabled ? 'text-up' : 'text-warn',
+    },
+    {
+      label: '行情源', value: quoteState.label,
+      hint: quoteState.hint, className: quoteState.className,
     },
   ];
   return (
@@ -548,8 +745,33 @@ function OverviewPane({ data }: { data: Overview }) {
   );
 }
 
-function Badge({ text, kind }: { text: string; kind: 'up' | 'down' | 'primary' | 'muted' }) {
-  const map = {
+// 行情健康卡：只报事实（条数、缓存年龄、数据落后多久、是否当日），结论留给检测
+function HealthCard({ item, fx }: { item: QuoteHealth; fx: number }) {
+  const state = !item.ok && !item.rows ? 'bad' : item.partial ? 'warn' : !item.fresh ? 'warn' : item.staleWarn ? 'warn' : 'ok';
+  const toneMap = { ok: 'border-down/40 bg-down/12 text-down', warn: 'border-warn/50 bg-warn/12 text-warn', bad: 'border-up/45 bg-up/12 text-up' } as const;
+  return (
+    <div className={`rounded border px-3 py-2.5 text-xs ${toneMap[state]}`}>
+      <p className="flex items-center justify-between gap-2">
+        <span className="text-[0.8125rem] font-medium">{MARKET_NAME[item.market === 'us' ? 'us' : 'cn']}行情</span>
+        <span className="num">{item.rows} 条</span>
+      </p>
+      <p className="num mt-1 text-[0.6875rem] leading-5">
+        缓存 {item.ageMs === null ? '未取过' : `${(item.ageMs / 1000).toFixed(1)}s`} · 阈值 {(item.ttlMs / 1000).toFixed(1)}s
+        · 数据落后 {item.dataAgeMinutes === null ? '—' : `${item.dataAgeMinutes} 分钟`}
+      </p>
+      <p className="num text-[0.6875rem] leading-5">
+        系统日 {item.today} · 数据日 {item.day || '空'} · {item.fresh ? '当日数据，可撮合' : '非当日数据，不撮合'}
+      </p>
+      <p className="num truncate text-[0.6875rem] leading-5" title={item.host}>{item.host}</p>
+      {(item.note || item.partial) && (
+        <p className="mt-1 text-[0.6875rem] leading-5">{item.note ? `上游错误：${item.note}` : ''}{item.partial ? ` · 降级：${item.partial}` : ''}</p>
+      )}
+      {item.market === 'us' && <p className="num text-[0.6875rem] text-ink-dim">折算 {(fx / 1e6).toFixed(4)} ¥/$</p>}
+    </div>
+  );
+}
+
+function Badge({ text, kind }: { text: string; kind: 'up' | 'down' | 'primary' | 'muted' }) {  const map = {
     up: 'border-up/40 bg-up/12 text-up', down: 'border-down/40 bg-down/12 text-down',
     primary: 'border-primary/45 bg-primary/12 text-primary', muted: 'border-hairline bg-muted text-muted-foreground',
   } as const;

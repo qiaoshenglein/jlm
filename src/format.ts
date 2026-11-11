@@ -89,7 +89,8 @@ export type Board = {
   indexes: Quote[]; etfs: Quote[]; stocks: Quote[]; gainers: Quote[]; losers: Quote[];
   // 美股没有涨跌家数接口，取不到就是 null，前端隐藏这一条而不是编一个 0
   breadth: { up: number; down: number; flat: number; limitUp: number; limitDown: number } | null;
-  status: { ok: boolean; note: string | null };
+  // partial：上游只挂掉一部分时的降级说明（例如 ETF 补取失败），池子仍然可用
+  status: { ok: boolean; note: string | null; partial?: string };
 };
 
 export type Clock = { day: string; hour: number; minute: number; second: number; weekend: boolean; stamp: string };

@@ -51,13 +51,17 @@ const API_MESSAGES = {
   name_invalid: '密钥备注名过长或含非法字符。',
 };
 
-const bad = (code, status = 400) => json({
-  ok: false, code, message: API_MESSAGES[code] ?? REASONS[code] ?? '请求未成功，请检查参数与当前状态。',
-}, status);
+// 校验类失败可以带附加字段（比如行情源哪几项不合法），让后台能把原话显示出来而不是只说「参数错误」
+const bad = (code, status = 400, extra = null) => {
+  const base = API_MESSAGES[code] ?? REASONS[code] ?? '请求未成功，请检查参数与当前状态。';
+  const detail = Array.isArray(extra?.rejected) && extra.rejected.length ? `${base}（${extra.rejected.join('；')}）` : base;
+  return json({ ok: false, code, message: detail, ...(extra && typeof extra === 'object' ? extra : {}) }, status);
+};
 
 const READ_ACTIONS = new Set(['board', 'sync', 'me', 'chart', 'leader', 'rules', 'lookup', 'search',
   'account', 'positions', 'orders', 'trades', 'markets', 'key_list',
-  'admin_overview', 'admin_users', 'admin_user', 'admin_orders', 'admin_audit', 'admin_settings']);
+  'admin_overview', 'admin_users', 'admin_user', 'admin_orders', 'admin_audit', 'admin_settings',
+  'admin_quote_status', 'admin_quote_check']);
 const WRITE_ACTIONS = new Set(['register', 'login', 'logout', 'order', 'cancel', 'preview', 'watch_add', 'watch_remove', 'watch_sort',
   'key_create', 'key_revoke',
   'admin_freeze', 'admin_unfreeze', 'admin_unlock', 'admin_revoke_sessions', 'admin_role', 'admin_grant_cash']);
@@ -366,7 +370,7 @@ export async function handle({ request, supabase }) {
     if (!error?.code && globalThis.process?.env && globalThis.process.env.NODE_ENV !== 'production') {
       console.error(`[app:${action}]`, error?.stack ?? error);
     }
-    if (error?.code) return bad(error.code, error.status ?? 503);
+    if (error?.code) return bad(error.code, error.status ?? 503, error.extra);
     return bad('server_error', 500);
   }
 }

@@ -70,6 +70,13 @@ try {
   await page.waitForFunction(() => document.body.innerText.includes('注册邀请码'), null, { timeout: 8_000 });
   await page.screenshot({ path: join(OUT, 'admin-settings.png') });
 
+  await page.getByRole('tab', { name: '行情源' }).click();
+  await page.waitForFunction(() => document.body.innerText.includes('立即检测八个端点'), null, { timeout: 12_000 });
+  await page.screenshot({ path: join(OUT, 'admin-quote.png') });
+  await page.getByRole('button', { name: '立即检测八个端点' }).click();
+  await page.waitForFunction(() => document.querySelectorAll('table tbody tr').length >= 8, null, { timeout: 60_000 });
+  await page.screenshot({ path: join(OUT, 'admin-quote-check.png') });
+
   await page.getByRole('tab', { name: '流水' }).click();
   await page.waitForTimeout(900);
   await page.screenshot({ path: join(OUT, 'admin-flow.png') });

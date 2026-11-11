@@ -47,6 +47,17 @@ try {
   await new Promise((r) => setTimeout(r, 300));
   ok('startup-logs-admin', /ADMIN|管理员|后台/.test(boot), boot.split('\n').filter((line) => /后台/.test(line)).join(' ').slice(0, 90));
 
+  // 上游拒连时每条断言都会变成超时，先把「行情源不可用」和「探针本身失败」分开说清楚
+  const quoteGate = await fetch(`${base}/functions/v1/app?action=board`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}',
+  }).then((r) => r.json()).catch(() => ({ ok: false, code: 'probe_fetch_failed' }));
+  if (!quoteGate.ok) {
+    console.log(`FAIL 行情源不可用 — ${quoteGate.code} ${String(quoteGate.message ?? '').slice(0, 60)}`);
+    console.log('探针未运行：以下断言全部依赖真实行情列表。稍后重试，或用后台「行情源」页逐项探测定位。');
+    child.kill();
+    process.exit(2);
+  }
+
   browser = await chromium.launch({ executablePath: CHROME, headless: true, args: ['--no-sandbox', '--mute-audio'] });
   const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
   const errors = [];

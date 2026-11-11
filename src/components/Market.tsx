@@ -190,6 +190,8 @@ export function MarketPanel({ board, selected, held, watch, watchQuotes, filter,
 
   const breadth = board?.breadth;
   const sourceBad = Boolean(board?.status && !board.status.ok);
+  // 上游只挂掉一部分时（比如单标的接口抖动）池子仍然可用，用更轻的一条话说明降级了什么
+  const sourcePartial = board?.status?.partial ?? '';
 
   return (
     <div className="panel flex h-full flex-col overflow-hidden">
@@ -226,9 +228,10 @@ export function MarketPanel({ board, selected, held, watch, watchQuotes, filter,
         {searching && <span className="skel absolute inset-x-2 bottom-0 h-0.5 rounded-full" />}
       </div>
 
-      {breadth && (!compact || sourceBad) && (
+      {/* 美股没有涨跌家数，但降级提示照样要占这一行，否则「行情源异常」在美股页根本没地方显示 */}
+      {(breadth || sourceBad || sourcePartial) && (
         <div className="num flex shrink-0 items-center gap-x-3 overflow-hidden whitespace-nowrap border-b border-hairline/70 px-3 py-1 text-[0.6875rem] text-ink-dim">
-          {!compact && (
+          {breadth && !compact && (
             <>
               <span>涨 <b className="text-up">{breadth.up}</b></span>
               <span>跌 <b className="text-down">{breadth.down}</b></span>
@@ -237,6 +240,7 @@ export function MarketPanel({ board, selected, held, watch, watchQuotes, filter,
             </>
           )}
           {sourceBad && <span className="shrink-0 rounded bg-up/15 px-1.5 text-up">行情源异常，显示上次快照</span>}
+          {!sourceBad && sourcePartial && <span className="shrink-0 rounded bg-warn/15 px-1.5 text-warn">行情部分降级 · {sourcePartial}</span>}
         </div>
       )}
 

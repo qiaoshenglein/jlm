@@ -2,7 +2,10 @@
 // 权限判定本身留在 api.mjs（它已有会话解析），这里只处理「已经确认是管理员」之后的事。
 import { MICRO, START_CASH, START_CASH_USD, clampText, etParts, inRange, normalizeLines, setParams, startBaseOf } from './rules.mjs';
 import { DEFAULT_PARAMS, DEFAULT_PARAMS_US, activeParams } from './rules.mjs';
-import { getFx } from './quotes.mjs';
+import {
+  QUOTE_HOSTS, QUOTE_PROBES, QUOTE_SOURCE_DEFAULTS, checkQuoteSource, getFx, getQuotes, getUsQuotes,
+  probeQuoteSource, quoteHealth, quoteSource, setQuoteSource,
+} from './quotes.mjs';
 import { replay, startCashOf, tradesOf } from './ledger.mjs';
 import { newId } from './auth.mjs';
 
@@ -17,6 +20,7 @@ export const SETTINGS_DEFAULTS = {
   match_paused_us: false,
   params: DEFAULT_PARAMS,
   us_params: DEFAULT_PARAMS_US,
+  quote_source: QUOTE_SOURCE_DEFAULTS,
 };
 
 const SETTING_KEYS = Object.keys(SETTINGS_DEFAULTS);
@@ -24,8 +28,11 @@ const BOOL_KEYS = ['register_enabled', 'match_paused', 'match_paused_us'];
 const CASH_KEYS = { start_cash: true, start_cash_usd: true };
 // 挂牌参数按市场分列存储：改美股费用不会碰 A 股，反之亦然
 const PARAM_KEYS = { params: 'cn', us_params: 'us' };
+// JSON 结构体配置：写入前都要过各自的校验器，落库的值一定是合法值
+const JSON_KEYS = { params: 'cn', us_params: 'us', quote_source: 'source' };
 const DEFAULTS_OF = { cn: DEFAULT_PARAMS, us: DEFAULT_PARAMS_US };
 const MAX_GRANT_MICRO = 1_000_000_000 * MICRO; // 单笔调整上限 10 亿（虚拟资金，防误操作）
+const CHECKS_PER_MINUTE = 12;
 
 // 分组深合并，缺项回落默认值：后台只改一条线时不会把其它线清空
 function mergeParams(base, patch, market = 'cn') {
@@ -58,10 +65,19 @@ function decode(key, raw) {
       return defaults;
     }
   }
+  if (key === 'quote_source') {
+    // 存进去之前已经校验过；这里再走一遍是为了兜住「手工改库」或「代码升级改了白名单」
+    try {
+      const parsed = JSON.parse(text);
+      return checkQuoteSource(parsed && typeof parsed === 'object' ? parsed : {}).values;
+    } catch {
+      return { ...QUOTE_SOURCE_DEFAULTS, etfs: [...QUOTE_SOURCE_DEFAULTS.etfs] };
+    }
+  }
   return clampText(text, 32);
 }
 
-const encode = (key, value) => String(key in PARAM_KEYS ? JSON.stringify(value)
+const encode = (key, value) => String(key in JSON_KEYS ? JSON.stringify(value)
   : BOOL_KEYS.includes(key) ? (value ? '1' : '0') : value ?? '');
 
 export async function readSettings(store) {
@@ -83,6 +99,8 @@ export async function readSettingsCached(store, ttl = 2_000) {
   // 把挂牌参数交给规则层，撮合与试算用的是同一份；两市各一份，互不覆盖
   setParams(values.params, 'cn');
   setParams(values.us_params, 'us');
+  // 行情源同理：设置里存的就是引擎实际在用的域名与 TTL
+  setQuoteSource(values.quote_source);
   settingsCache.at = now;
   settingsCache.values = values;
   return values;
@@ -135,7 +153,29 @@ export async function writeAudit(store, { admin, action, target, detail, ip, now
   });
 }
 
-const fail = (code, status = 400) => Object.assign(new Error(code), { code, status });
+const fail = (code, status = 400, extra = null) => Object.assign(new Error(code), { code, status, extra });
+
+// 检测会打真实上游，所以这里自带一个按管理员的滑动窗口限频（进程内计数，重启归零）
+const windows = new Map();
+function throttledHere(key, limit, windowMs, nowMs) {
+  const hit = windows.get(key);
+  if (!hit || nowMs - hit.at > windowMs) {
+    if (windows.size > 2000) windows.clear();
+    windows.set(key, { at: nowMs, n: 1 });
+    return false;
+  }
+  hit.n += 1;
+  return hit.n > limit;
+}
+
+const MARKET_LABEL = { cn: '沪深', us: '美股' };
+let lastQuoteCheck = null;
+
+// 概览只带够判断「行情是否正常」的几个字段，不搬运整个健康度对象
+const pickHealth = (item) => ({
+  ok: item.ok, fresh: item.fresh, rows: item.rows, note: item.note, partial: item.partial,
+  dataAgeMinutes: item.dataAgeMinutes, staleWarn: item.staleWarn,
+});
 
 function dayStartMs(today) {
   // today 形如 2026-11-04（北京日期）→ 该日 00:00 北京时间的 UTC 毫秒
@@ -176,6 +216,13 @@ export async function runAdmin({ store, action, admin, body, nowMs, today, ip })
       // 熔断是分市场的：概览里两条都要露出来，否则「美股还在撮合」看不出来
       breakers: { cn: Boolean(settings.match_paused), us: Boolean(settings.match_paused_us) },
       risk: { belowCall, belowLiquid, leveraged: [...snaps.values()].filter((snap) => snap.total_debt > 0).length },
+      // 行情源只读概览：不打上游，只报缓存里的事实；要看逐端点结果去「行情源」页点检测
+      quote: {
+        source: quoteSource().listHost,
+        cn: pickHealth(quoteHealth('cn', new Date(nowMs))),
+        us: pickHealth(quoteHealth('us', new Date(nowMs))),
+        lastCheck: lastQuoteCheck,
+      },
       stats,
       recent: await store.listAudit(8, 0),
     };
@@ -321,7 +368,7 @@ export async function runAdmin({ store, action, admin, body, nowMs, today, ip })
       if (body.confirm !== true) throw fail('confirm_required', 400);
       const patch = body.patch;
       const before = await readSettings(store);
-      const next = { ...before, params: { ...before.params }, us_params: { ...before.us_params } };
+      const next = { ...before, params: { ...before.params }, us_params: { ...before.us_params }, quote_source: { ...before.quote_source, etfs: [...before.quote_source.etfs] } };
       for (const key of ['register_enabled', 'invite_code', 'start_cash', 'start_cash_usd', 'match_paused', 'match_paused_us']) {
         if (patch[key] === undefined) continue;
         let value = patch[key];
@@ -354,6 +401,13 @@ export async function runAdmin({ store, action, admin, body, nowMs, today, ip })
         // 只对担保线做次序归一化，费率与利率原样保留；先全部校验再一次性落库
         next[key] = { ...merged, lines: normalizeLines(merged.lines) };
       }
+      // 行情源：域名必须在白名单里、数值必须在边界内，任何一项不合法就整次拒绝，
+      // 并把不合法的项原样说回去（否则后台的「已保存」会是假象）
+      if (patch.quote_source && typeof patch.quote_source === 'object') {
+        const { values, rejected } = checkQuoteSource({ ...next.quote_source, ...patch.quote_source });
+        if (rejected.length) throw fail('param_invalid', 400, { rejected });
+        next.quote_source = values;
+      }
       for (const key of SETTING_KEYS) await store.setSetting(key, encode(key, next[key]), admin.id, stamp);
       invalidateSettings();
       const after = await readSettingsCached(store, 0);
@@ -370,15 +424,71 @@ export async function runAdmin({ store, action, admin, body, nowMs, today, ip })
           if (Object.keys(part).length) changed[`${key}.${group}`] = part;
         }
       }
+      // 行情源变更要单独留痕：换域名或放大池子都会改变上游压力与覆盖面
+      for (const name of Object.keys(after.quote_source)) {
+        const was = before.quote_source[name];
+        const now = after.quote_source[name];
+        if (JSON.stringify(was) !== JSON.stringify(now)) changed[`quote_source.${name}`] = now;
+      }
       await writeAudit(store, { admin, action, target: 'settings', detail: { changed }, ip, nowMs });
       return {
-        settings: after, params: activeParams('cn'), usParams: activeParams('us'), changed,
+        settings: after, params: activeParams('cn'), usParams: activeParams('us'),
+        source: quoteSource(), changed,
       };
     }
     return {
       settings: await readSettingsCached(store, 0), defaults: SETTINGS_DEFAULTS,
-      params: activeParams('cn'), usParams: activeParams('us'),
+      params: activeParams('cn'), usParams: activeParams('us'), source: quoteSource(),
     };
+  }
+
+  if (action === 'admin_quote_status') {
+    const settings = await readSettingsCached(store, 0);
+    const now = new Date(nowMs);
+    return {
+      source: quoteSource(),
+      defaults: QUOTE_SOURCE_DEFAULTS,
+      hosts: QUOTE_HOSTS,
+      probes: QUOTE_PROBES.map(({ key, label, note }) => ({ key, label, note })),
+      health: { cn: quoteHealth('cn', now), us: quoteHealth('us', now) },
+      fx: await getFx(now).catch(() => 0),
+      settings: { match_paused: settings.match_paused, match_paused_us: settings.match_paused_us },
+      // 上一次检测的结果留在进程里：概览页要显示结论，但不该为此再打一次上游
+      lastCheck: lastQuoteCheck,
+    };
+  }
+
+  if (action === 'admin_quote_check') {
+    // 一次检测 = 八个端点各打一次 + 两个市场的池子重建，所以单独限频且顺序执行，不并发
+    if (throttledHere(`quote:${admin.id}`, CHECKS_PER_MINUTE, 60_000, nowMs)) throw fail('too_many_requests', 429);
+    const now = new Date(nowMs);
+    const results = [];
+    for (const item of QUOTE_PROBES) results.push(await probeQuoteSource(item.key, now));
+    // 探测单条通了不代表池子能建起来：再按线上路径强制重建一次，健康度才是真话
+    await Promise.allSettled([getQuotes(true, now), getUsQuotes(true, now)]);
+    const health = { cn: quoteHealth('cn', now), us: quoteHealth('us', now) };
+    const okCount = results.filter((row) => row.ok).length;
+    const verdict = okCount === results.length ? 'ok' : okCount === 0 ? 'down' : 'partial';
+    const advice = [];
+    const failed = (key) => results.find((row) => row.key === key && !row.ok);
+    if (failed('cn_board')) advice.push('沪深板块池取不到：A 股列表与撮合会退到上一次快照，当日判定不通过时自动停撮合。');
+    if (failed('us_board')) advice.push('美股板块池取不到：美股列表与撮合退到上一次快照。');
+    if (failed('single')) advice.push('单标的接口不可用：行情池外的标的（自选补价、按代码直查）取不到新价，池内标的不受影响。');
+    if (failed('trends') || failed('kline')) advice.push('历史接口不可用：分时与日 K 显示「暂时取不到」，撮合与账本不受影响。');
+    if (failed('suggest')) advice.push('检索接口不可用：搜索只能命中行情池内已有标的。');
+    if (failed('fx')) advice.push('汇率取不到：合并口径沿用上次值或兜底 6.7，只影响展示，不影响记账。');
+    const usIndexRow = results.find((row) => row.key === 'us_index');
+    if (usIndexRow?.ok && (usIndexRow.rows ?? 0) < 4) advice.push(`美股指数只有 ${usIndexRow.rows}/4 条：板块池仍可用，指数条会缺项。`);
+    for (const item of [health.cn, health.us]) {
+      if (!item.fresh) advice.push(`${MARKET_LABEL[item.market]}行情时间戳不在当日：本轮不撮合（休市、节假日或上游延迟），系统时间 ${item.today}，数据日 ${item.day || '空'}。`);
+      else if (item.staleWarn) advice.push(`${MARKET_LABEL[item.market]}数据已落后 ${item.dataAgeMinutes} 分钟，超过告警阈值。`);
+      else if (item.partial) advice.push(`${MARKET_LABEL[item.market]}部分降级：${item.partial}。`);
+    }
+    lastQuoteCheck = {
+      at: stamp, verdict, okCount, total: results.length,
+      slowest: results.reduce((max, row) => (row.ms > (max?.ms ?? -1) ? row : max), null)?.ms ?? 0,
+    };
+    return { results, verdict, okCount, total: results.length, health, advice, source: quoteSource(), checkedAt: stamp };
   }
 
   if (action === 'admin_audit') {

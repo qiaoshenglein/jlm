@@ -92,8 +92,9 @@ curl -X POST http://127.0.0.1:8791/api/v1/order \
 ```
 
 - `session.phase`：A 股 `auction | open | lunch | closed`；美股 `pre | open | after | closed`。
-- `matchable`：该市场此刻是否参与撮合（时段 + 未被后台熔断 + 非周末）。
-- `paused`：后台是否对该市场拉了撮合熔断。`matchable=false` 时挂单只会排队，不会成交。
+- `clock.minute` 是**当日累计分钟**（0–1439，`570` = 9:30），不是「分」；要读时间用 `clock.stamp` 或 `beijing` / `et`。
+- `matchable`：该市场此刻是否参与撮合（时段 + 未被后台熔断 + 非周末 + **行情时间戳为当日**）。行情源取不到或不是当日数据时它也是 false，此时挂单只排队不成交——后台「行情源」页可以逐项探测确认是哪个端点断了。
+- `paused`：后台是否对该市场拉了撮合熔断。
 - `fx`：美元兑离岸人民币（微单位，`6668100` = 6.6681）。
 
 ### `GET /api/v1/quote?symbol=…`

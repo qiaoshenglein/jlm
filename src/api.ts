@@ -112,7 +112,11 @@ export async function api<T>(action: string, payload: Payload = {}, quiet = fals
   if (!response.ok || body.ok === false) {
     const resolved = code ?? 'request_failed';
     if (resolved === 'login_required') writeToken(null);
-    throw new ApiError(messageFor(resolved), resolved, response.status);
+    // 服务端现在总带一句可读的 message：本地没收录的错误码（比如行情源校验项）就用原话，
+    // 本地已有的（比如登录失效）保持交易台里更贴切的说法
+    const local = MESSAGES[resolved];
+    const serverMessage = typeof body.message === 'string' ? body.message : '';
+    throw new ApiError(local || serverMessage || messageFor(resolved), resolved, response.status);
   }
   return data as T;
 }

@@ -110,6 +110,13 @@ check('未登录访问受保护接口 401', noAuth.status === 401, `status=${noA
 
 // 2) 行情
 const board = await call('board', {}, undefined);
+if (!(board.json.market?.indexes?.length >= 5)) {
+  // 上游取不到行情时继续跑只会得到一片 suspended，看起来像代码回归；这里直接停下来把原因说清楚
+  console.log(`FAIL  行情源不可用 — 指数池只有 ${board.json.market?.indexes?.length ?? 0} 条，后续断言全部依赖真实行情，先停下`);
+  console.log(`      状态：${JSON.stringify(board.json.market?.status ?? board.json.code)}`);
+  console.log('\n结果：未运行（行情源不可用。稍后重试，或用后台「行情源」页逐项探测定位）');
+  process.exit(2);
+}
 check('指数行情可用', board.json.market?.indexes?.length >= 5, `${board.json.market?.indexes?.length ?? 0} 条指数`);
 const sh = board.json.market.indexes.find((q) => q.code === '000001') ?? board.json.market.indexes[0];
 console.log(`      上证指数 ¥${yuan(sh.last)} 涨跌 ${sh.pct.toFixed(2)}% 昨收 ${yuan(sh.prevClose)}`);
@@ -651,6 +658,72 @@ for (let i = 0; i < 11; i += 1) batch.push(await call('key_create', { name: `批
 check('每账户有效密钥上限 10 把', batch.slice(0, 10).every((row) => row.json.ok === true)
   && batch[10].json.code === 'key_limit' && batch[10].status === 409,
   `第 11 把 → ${batch[10].json.code}`);
+
+// ==== 行情源配置与检测 ====
+const quoteStatus1 = await call('admin_quote_status', {}, bossToken);
+check('后台能读到行情源配置与健康度', quoteStatus1.json.ok === true
+  && (quoteStatus1.json.hosts ?? []).length >= 2 && quoteStatus1.json.probes?.length === 8
+  && quoteStatus1.json.source?.listHost === 'push2.eastmoney.com'
+  && Boolean(quoteStatus1.json.health?.cn) && Boolean(quoteStatus1.json.health?.us),
+  `域名 ${quoteStatus1.json.hosts?.length ?? 0} 个 · 探测项 ${quoteStatus1.json.probes?.length ?? 0} 个`);
+
+const badHost = await call('admin_settings', { patch: { quote_source: { listHost: 'evil.example.com' } }, confirm: true }, bossToken);
+check('白名单外的域名被拒且说清哪一项', badHost.status === 400 && badHost.json.code === 'param_invalid'
+  && (badHost.json.rejected ?? []).some((text) => text.includes('listHost')),
+  `${badHost.json.code} · ${(badHost.json.rejected ?? [])[0] ?? ''}`);
+const overRange = await call('admin_settings', { patch: { quote_source: { cnPoolSize: 99999, timeoutMs: 5 } }, confirm: true }, bossToken);
+check('越界的行情源数值被拒', overRange.json.code === 'param_invalid' && (overRange.json.rejected ?? []).length === 2,
+  (overRange.json.rejected ?? []).join('；'));
+
+const savedSource = await call('admin_settings', {
+  patch: { quote_source: { cnPoolSize: 80, listHost: 'push2delay.eastmoney.com', etfs: ['1.510300', 'bad-code', '0.159915'] } },
+  confirm: true,
+}, bossToken);
+const sourceAfter = (await call('admin_quote_status', {}, bossToken)).json.source;
+check('合法的行情源改动立即生效并留痕', savedSource.json.ok === true && sourceAfter?.cnPoolSize === 80
+  && sourceAfter?.listHost === 'push2delay.eastmoney.com' && sourceAfter?.etfs?.length === 2
+  && JSON.stringify(savedSource.json.changed).includes('quote_source.cnPoolSize'),
+  `池 ${sourceAfter?.cnPoolSize} · 域名 ${sourceAfter?.listHost} · ETF ${sourceAfter?.etfs?.length} 条（非法代码已剔除）`);
+
+const checked = await call('admin_quote_check', {}, bossToken);
+const rowsOk = (checked.json.results ?? []).length === 8
+  && (checked.json.results ?? []).every((row) => typeof row.ms === 'number' && 'ok' in row);
+check('一键检测逐端点返回结果与结论', checked.json.ok === true && rowsOk
+  && ['ok', 'partial', 'down'].includes(checked.json.verdict) && Array.isArray(checked.json.advice),
+  `结论 ${checked.json.verdict} · 可用 ${checked.json.okCount}/${checked.json.total} · 建议 ${checked.json.advice?.length ?? 0} 条`);
+const notAdminCheck = await call('admin_quote_check', {}, token);
+check('普通用户不能触发行情源检测', notAdminCheck.status === 403 && notAdminCheck.json.code === 'not_admin', notAdminCheck.json.code);
+await call('admin_settings', { patch: { quote_source: quoteStatus1.json.defaults }, confirm: true }, bossToken);
+
+// 单标的接口全挂时，A 股池不该跟着一起空掉：这里用假上游把这条容错固定住，不依赖网络状态
+const quotes = await import('../functions/quotes.mjs');
+const realFetch = globalThis.fetch;
+const fakeDiff = (market, count, prefix) => Array.from({ length: count }, (_, index) => ({
+  f2: 10 + index / 10, f3: 1.5, f4: 0.1, f5: 1000, f6: 1e7 + index, f7: 2, f8: 1.2,
+  f12: `${prefix}${String(100000 + index + market * 0)}`, f13: market, f14: `假标的${index}`,
+  f15: 11, f16: 9.5, f17: 10.2, f18: 10, f20: 1e10, f124: Math.floor(clock / 1000),
+}));
+globalThis.fetch = async (url) => {
+  const text = String(url);
+  if (text.includes('/api/qt/stock/get')) throw new Error('forced_socket_reset');
+  if (text.includes('fs=b:MK0010')) return new Response(JSON.stringify({ data: { diff: fakeDiff(1, 10, '0000') } }));
+  if (text.includes('/api/qt/clist/get')) return new Response(JSON.stringify({ data: { diff: fakeDiff(1, 30, '6000') } }));
+  return realFetch(url);
+};
+let degraded = null;
+try {
+  const pool = await quotes.getQuotes(true, new Date());
+  degraded = { size: pool.size, status: quotes.quoteStatus(), etf: pool.get('1.510300') ?? null };
+} catch (error) {
+  degraded = { size: 0, status: { ok: false, note: String(error.message) }, error: true };
+} finally {
+  globalThis.fetch = realFetch;
+}
+check('单标的接口全挂时 A 股池仍然可用并标注降级', degraded.error !== true && degraded.size >= 20
+  && degraded.status.ok === true && /ETF 补取失败/.test(String(degraded.status.partial ?? ''))
+  && degraded.etf === null,
+  `池 ${degraded.size} 条 · partial=${degraded.status.partial ?? '无'} · note=${degraded.status.note ?? '无'}`);
+quotes.setQuoteSource({}); // 清掉假数据留下的快照，后面的断言继续用真实行情
 
 console.log(`\n结果：${failures === 0 ? '全部通过' : `${failures} 项未通过`}`);
 process.exit(failures === 0 ? 0 : 1);
