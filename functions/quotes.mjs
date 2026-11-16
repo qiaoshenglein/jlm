@@ -472,7 +472,7 @@ export function quoteHealth(market = 'cn', now = new Date()) {
 // ---- 后台「行情源检测」：逐源逐能力实测，打的就是线上用的那条代码路径 ----
 const CAP_LABELS = {
   cnStocks: '沪深个股池', cnIndexes: '沪深指数', cnEtfs: '指数 ETF 补价', usStocks: '美股池', usIndexes: '美股指数',
-  one: '单标的快照', fx: '汇率', trends: '当日分时', kline: '日 K 线', suggest: '代码检索',
+  one: '单标的快照', fx: '汇率', trends: '当日分时', kline: '日 K / 周 K', suggest: '代码检索',
 };
 const CAP_NOTES = {
   cnStocks: 'A 股列表与撮合的主要来源',
@@ -483,7 +483,7 @@ const CAP_NOTES = {
   one: '持仓与搜索命中的池外标的靠它补价',
   fx: '美元池折人民币的合并口径；取不到会退回兜底值',
   trends: '分时图',
-  kline: '蜡烛图与均线',
+  kline: '蜡烛图与 MACD（日 K / 周 K）',
   suggest: '输入代码或拼音首字母时的联想',
 };
 
@@ -561,7 +561,7 @@ export async function ensureQuote(secid, quotes, now = new Date()) {
   }
 }
 
-// ---- 图表：分时 20 秒、日 K 5 分钟，同标的并发请求合并 ----
+// ---- 图表：分时 20 秒、日/周 K 5 分钟，同标的并发请求合并 ----
 // 前端会预取悬停与相邻标的，没有这一层就会把上游打爆、把点击拖慢
 const NEGATIVE_TTL = 5_000;
 
@@ -590,8 +590,10 @@ export function trendsOf(secid, now = new Date()) {
   return cachedChart(`trends:${secid}`, SOURCE.trendsTtlMs, async () => (await withChain('trends', [secid], now.getTime())).value);
 }
 
-export function klineOf(secid, count = 120, now = new Date()) {
-  return cachedChart(`kline:${secid}:${count}`, SOURCE.klineTtlMs, async () => (await withChain('kline', [secid, count], now.getTime())).value);
+export function klineOf(secid, count = 120, period = 'day', now = new Date()) {
+  const span = period === 'week' ? 'week' : 'day';
+  return cachedChart(`kline:${secid}:${span}:${count}`, SOURCE.klineTtlMs,
+    async () => (await withChain('kline', [secid, count, span], now.getTime())).value);
 }
 
 // ---- 检索：建议接口 + 本地代码索引兜底中文名 ----

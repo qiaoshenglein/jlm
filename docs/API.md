@@ -135,15 +135,16 @@ curl -X POST http://127.0.0.1:8791/api/v1/order \
   "rows": [ { "secid": "105.NVDA", "code": "NVDA", "name": "英伟达", "kind": "stock", "last": 203100000, "pct": -1.77, "tradable": true } ] }
 ```
 
-### `GET /api/v1/chart?symbol=…&kind=trends|kline&count=120`
-分时与日 K。`count` 范围 30–320，仅对 `kline` 生效。
+### `GET /api/v1/chart?symbol=…&kind=trends|kline&period=day|week&count=120`
+分时与 K 线。`count` 范围 30–320，仅对 `kline` 生效；`period` 同样只对 `kline` 生效（`week` 为周 K，缺省 `day`），分时那一档恒回 `period=day`。
 
 ```json
-{ "ok": true, "secid": "105.AAPL", "symbol": "AAPL", "kind": "kline", "market": "us",
+{ "ok": true, "secid": "105.AAPL", "symbol": "AAPL", "kind": "kline", "period": "week", "market": "us",
   "series": [ { "day": "2026-11-04", "open": 341580000, "close": 349815000, "high": 350810000, "low": 340990000, "volume": 14228157 } ] }
 ```
 
 `kind=trends` 时返回 `{ name, preClose, points: [{ t, price, volume, avg }] }`，`t` 是该市场所在时区的 `HH:MM`。
+周 K 一根的日期取该周最后一个交易日；东财与腾讯走原生周线，腾讯个别标的与新浪只有日线时由服务端取日线按周合并（ISO 周，周一为一周之始）。MACD（12/26/9，柱 = 2×(DIF−DEA)）不在接口里返回，由前端用同一份 `series` 现算，保证网页与接口口径一致。
 
 ### `GET /api/v1/rules`
 两市规则与**当前挂牌参数**（后台可热改，这里读到的就是引擎正在用的值）。

@@ -5,6 +5,8 @@
 const RealDate = Date;
 const beijing = new RealDate(Date.now() + 8 * 3600_000);
 const day = `${beijing.getUTCFullYear()}-${String(beijing.getUTCMonth() + 1).padStart(2, '0')}-${String(beijing.getUTCDate()).padStart(2, '0')}`;
+// 上一个「同一天」的日期，用来给周线造假数据：周 K 的首根必须落在这天
+const weekAgo = new RealDate(new RealDate(`${day}T00:00:00Z`).getTime() - 7 * 86400_000).toISOString().slice(0, 10);
 let clock = new RealDate(`${day}T05:30:00Z`).getTime();
 globalThis.Date = class extends RealDate {
   constructor(...args) { super(args.length ? args[0] : clock); }
@@ -49,6 +51,7 @@ function sinaFields(name, price) {
 }
 // ---- 假上游：三家各一套 URL 形状，开关控制谁活着 ----
 const alive = { em: true, tx: true, sina: true };
+const flags = { txNoWeek: false };
 let calls = [];
 const QQ_RANK = Array.from({ length: 80 }, (_, i) => `sz${300000 + i}`);
 globalThis.fetch = async (input) => {
@@ -91,6 +94,11 @@ globalThis.fetch = async (input) => {
       return json({ data: { name: '假标的', preClose: 10, trends: [`${day} 09:30,10.1,100,10.05`, `${day} 09:31,10.2,120,10.06`] } });
     }
     if (u.includes('/api/qt/stock/kline/get')) {
+      // klt=101 日线、102 周线：周线必须回不同的周，否则断言分不清到底走没走原生周线
+      if (u.includes('klt=102')) {
+        return json({ data: { klines: [`${weekAgo},9.6,10,10.4,9.5,4800`, `${day},10,10.2,10.3,9.9,1000`, `${day},10.2,10.4,10.5,10.1,1200`] } });
+      }
+      if (!u.includes('klt=101')) throw new Error(`未假定的 klt：${u.slice(u.indexOf('klt='), u.indexOf('klt=') + 12)}`);
       return json({ data: { klines: [`${day},10,10.2,10.3,9.9,1000`, `${day},10.2,10.4,10.5,10.1,1200`] } });
     }
   }
@@ -126,6 +134,12 @@ globalThis.fetch = async (input) => {
       return json({ code: 0, data: { [native]: { data: { date: day.replace(/-/g, ''), data: ['0930 20.00 100 200000.00', '0931 20.10 120 240000.00'] }, qt: { [native]: qqFields('TXMIN', native.slice(2), 20) } } } });
     }
     const rows = Array.from({ length: 5 }, (_, i) => [`${day},20,20.2,20.3,19.9,1000`, `${day},20.2,20.4,20.5,20.1,1200`][i % 2]);
+    // 周线走 week / qfqweek 键；flags.txNoWeek 模拟「这条接口对该标的根本不回周线」
+    const span = (u.match(/param=\w+,(\w+),/) ?? [])[1] ?? 'day';
+    if (span === 'week' && !flags.txNoWeek) {
+      const weeks = [`${weekAgo},19,20,20.6,18.9,5200`, `${day},20,20.2,20.5,19.8,5400`];
+      return json({ code: 0, data: { [native]: { [native.startsWith('us') ? 'week' : 'qfqweek']: weeks.map((line) => line.split(',')) } } });
+    }
     return json({ code: 0, data: { [native]: { [native.startsWith('us') ? 'day' : 'qfqday']: rows.map((line) => line.split(',')) } } });
   }
 
@@ -335,11 +349,62 @@ const txTrends = await trendsTx;
 ok('分时在东财挂时由腾讯补上', (txTrends?.points?.length ?? 0) > 0 && txTrends.preClose > 0,
   `${txTrends?.points?.length} 点 · 昨收 ${txTrends?.preClose / 1e6}`);
 alive.em = false; alive.tx = false;
-const klineSina = await quotes.klineOf('1.600519', 5, new RealDate(clock)).catch(() => null);
+const klineSina = await quotes.klineOf('1.600519', 5, 'day', new RealDate(clock)).catch(() => null);
 alive.em = true; alive.tx = true;
 ok('日 K 逐级下探到新浪并按其字段序还原 OHLC',
   (klineSina?.length ?? 0) === 2 && klineSina[0].high >= klineSina[0].low && klineSina[0].close > 0,
   JSON.stringify(klineSina?.[0] ?? null));
+
+// ---- 11b. 周 K：三家各有各的取法，缓存按 period 分档 ----
+// 上一节东财与腾讯都被判过失败，冷却没过源链就会直接跳到新浪，这段便测不到原生周线
+tick(65_000);
+resetCalls();
+const weekEm = await quotes.klineOf('1.600519', 5, 'week', new RealDate(clock)).catch(() => null);
+const dayCached = await quotes.klineOf('1.600519', 5, 'day', new RealDate(clock)).catch(() => null);
+ok('周 K 首选东财原生 klt=102，且与同参数的日 K 各存各的缓存',
+  (weekEm?.length ?? 0) === 3 && weekEm[0].day === weekAgo
+  && calls.length === 1 && calls[0].includes('klt=102')
+  && (dayCached?.length ?? 0) === 2 && dayCached[0].day === day,
+  `周 ${weekEm?.length} 根（首根 ${weekEm?.[0]?.day}）· 日 ${dayCached?.length} 根 · 出网 ${calls.length} 次`);
+
+alive.em = false;
+resetCalls();
+const weekTx = await quotes.klineOf('1.600519', 6, 'week', new RealDate(clock)).catch(() => null);
+alive.em = true;
+ok('东财挂时周 K 由腾讯的 week 键接管',
+  (weekTx?.length ?? 0) === 2 && weekTx[0].day === weekAgo && calls.some((u) => u.includes(',week,')),
+  `${weekTx?.length} 根 · 域名 ${hostsCalled().join(',')} · 周线请求 ${calls.filter((u) => u.includes(',week,')).length} 次`);
+
+flags.txNoWeek = true; alive.em = false;
+resetCalls();
+const weekTxDaily = await quotes.klineOf('1.600519', 8, 'week', new RealDate(clock)).catch(() => null);
+alive.em = true; flags.txNoWeek = false;
+ok('腾讯不回周线时退回「多取日线、本地按周合并」，周 K 不会整个空掉',
+  (weekTxDaily?.length ?? 0) === 1 && weekTxDaily[0].volume === 5_400
+  && calls.some((u) => u.includes(',week,')) && calls.some((u) => u.includes(',day,')),
+  `${weekTxDaily?.length} 根 · 量 ${weekTxDaily?.[0]?.volume} · 出网 ${calls.length} 次`);
+
+alive.em = false; alive.tx = false;
+resetCalls();
+const weekSina = await quotes.klineOf('1.600519', 7, 'week', new RealDate(clock)).catch(() => null);
+alive.em = true; alive.tx = true;
+ok('新浪只有日线：周 K 靠本地合并，datalen 有 60 行的下限保证够合并',
+  (weekSina?.length ?? 0) === 1 && weekSina[0].volume === 2_200
+  && calls.some((u) => u.includes('scale=240') && u.includes('datalen=60')),
+  JSON.stringify(weekSina?.[0] ?? null));
+
+// chart 接口这一段要重新走源链：上一节把东财与腾讯都打进冷却了，不推时钟就只会命中新浪
+// count 有 30 的下限（与接口口径一致），所以这里用 40，不复用上面 count=5 的那份缓存
+tick(65_000);
+const chartWeek = await call('chart', { secid: '1.600519', kind: 'kline', period: 'week', count: 40 });
+const chartDay = await call('chart', { secid: '1.600519', kind: 'kline', count: 40 });
+const chartTrends = await call('chart', { secid: '1.600519', kind: 'trends', period: 'week' });
+ok('chart 接口按 period 分档返回，日/周互不覆盖',
+  chartWeek.json.ok === true && chartWeek.json.period === 'week' && chartWeek.json.series?.length === 3
+  && chartWeek.json.series?.[0]?.day === weekAgo
+  && chartDay.json.period === 'day' && chartDay.json.series?.length === 2
+  && chartTrends.json.period === 'day' && Array.isArray(chartTrends.json.series?.points),
+  `周 ${chartWeek.json.series?.length} 根（首根 ${chartWeek.json.series?.[0]?.day}）· 日 ${chartDay.json.series?.length} 根 · 分时 ${chartTrends.json.series?.points?.length} 点`);
 
 // ---- 12. 配置校验：源序、冷却、新域名 ----
 const badOrder = await call('admin_settings', { patch: { quote_source: { sourceOrder: ['eastmoney', 'baidu'] } }, confirm: true }, bt);

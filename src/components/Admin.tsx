@@ -79,6 +79,10 @@ type QuoteStatus = {
   health: { cn: QuoteHealth; us: QuoteHealth }; fx: number;
   fxSource: { provider: string | null; label: string | null; fallback: boolean };
   lastCheck: LastCheck | null;
+  proxy?: {
+    settings: ProxyPolicy; defaults: ProxyPolicy; status: ProxyStatus; runtime: string; lastCheck: LastCheck | null;
+    presets?: { key: string; label: string; url: string; docs: string; note: string }[];
+  };
 };
 type ProbeRow = {
   key: string; label?: string; host?: string; ok: boolean; ms: number;
@@ -91,6 +95,33 @@ type QuoteCheck = {
   coverage: CoverageRow[]; dead: string[]; providers: ProviderState[];
   health: { cn: QuoteHealth; us: QuoteHealth }; advice: string[]; source: QuoteSource; checkedAt: string;
 };
+
+type ProxyPolicy = {
+  enabled: boolean; mode: string; apiUrl: string; protocol: string; count: number;
+  ttlMs: number; minPullMs: number; maxFails: number; connectMs: number; totalMs: number;
+  directCoolMs: number; manual: string[];
+};
+type ProxyPoolRow = {
+  addr: string; source: string; pinned: boolean; fails: number; ok: number; probes: number;
+  blocked: boolean; usable: boolean; lastError: string | null; lastMs: number | null;
+  lastOkAt: string | null; ageMs: number | null;
+};
+type ProxyStatus = {
+  policy: ProxyPolicy; pool: ProxyPoolRow[]; alive: number;
+  counters: {
+    pulls: number; lastPullAt: string | null; lastPullError: string | null; served: number;
+    lastVia: string | null; directOk: number; proxyOk: number; proxyFail: number; poolAgeMs: number | null;
+  };
+  direct: { fails: number; lastError: string | null; okAt: string | null; coolingMs: number };
+};
+type ProxyRow = { addr: string; ok: boolean; ms: number; rows?: number; error?: string; blocked?: boolean };
+type ProxyCheckResult = {
+  verdict: 'ok' | 'partial' | 'down'; okCount: number; total: number; results: ProxyRow[];
+  pulled: { added?: number; error?: string | null; skipped?: boolean };
+  advice: string[]; lastCheck: LastCheck | null; status: ProxyStatus;
+  policy: { enabled: boolean; mode: string }; source: { apiUrl: string; mode: string; enabled: boolean };
+};
+type ProxyPull = { added?: number; pool?: number; error?: string | null; skipped?: boolean; status: ProxyStatus };
 
 type BackupCounts = Record<string, number>;
 type BackupDocument = {
@@ -123,6 +154,17 @@ const SCOPE_HINT: Record<string, [string, string]> = {
   sessions: ['会话摘要', '勾上后旧实例已登录的浏览器在新实例继续有效'],
 };
 
+// 代理这一堆数值：边界值同样由服务端校验，这里只解释每一项在管什么
+const PROXY_FIELDS: { key: keyof ProxyPolicy; label: string; hint: string }[] = [
+  { key: 'count', label: '一次取几个', hint: '向列表 API 要多少条' },
+  { key: 'maxFails', label: '连挂几个剔除', hint: '连续失败次数上限' },
+  { key: 'connectMs', label: '建连上限', hint: '毫秒，与代理握手的最长等待' },
+  { key: 'totalMs', label: '单次请求上限', hint: '毫秒，含隧道与正文' },
+  { key: 'ttlMs', label: '列表有效期', hint: '毫秒，过期就重新取' },
+  { key: 'minPullMs', label: '取列表最小间隔', hint: '毫秒，防把配额烧光' },
+  { key: 'directCoolMs', label: '直连冷却', hint: '毫秒，直连失败后这段时间只用代理' },
+];
+
 // 数值项的展示顺序与说明；边界值由服务端校验，这里只负责写清楚每一项在管什么
 const SOURCE_FIELDS: { key: keyof QuoteSource; label: string; hint: string }[] = [
   { key: 'timeoutMs', label: '上游超时', hint: '毫秒，单次请求最长等待' },
@@ -130,7 +172,7 @@ const SOURCE_FIELDS: { key: keyof QuoteSource; label: string; hint: string }[] =
   { key: 'usTtlMs', label: '美股快照间隔', hint: '毫秒' },
   { key: 'fxTtlMs', label: '汇率缓存', hint: '毫秒，只影响折算展示' },
   { key: 'trendsTtlMs', label: '分时缓存', hint: '毫秒' },
-  { key: 'klineTtlMs', label: '日 K 缓存', hint: '毫秒' },
+  { key: 'klineTtlMs', label: 'K 线缓存', hint: '毫秒；日 K 与周 K 同档各存各的' },
   { key: 'cnPoolSize', label: '沪深个股池', hint: '按成交额取前 N 只' },
   { key: 'usPoolSize', label:  '美股池', hint: '三个交易所合起来取前 N 只' },
   { key: 'indexPoolSize', label: '指数池', hint: '条数' },
@@ -145,7 +187,7 @@ const PROVIDER_HOST_FIELDS: { key: string; label: string; fields: { key: keyof Q
     fields: [
       { key: 'listHost', label: '板块接口域名', hint: '沪深与美股池、美股指数都走它' },
       { key: 'singleHost', label: '单标的域名', hint: '池外标的补价与汇率' },
-      { key: 'histHost', label: '历史接口域名', hint: '分时与日 K' },
+      { key: 'histHost', label: '历史接口域名', hint: '分时与 K 线' },
       { key: 'searchHost', label: '检索接口域名', hint: '代码联想' },
     ],
   },
@@ -156,7 +198,7 @@ const PROVIDER_HOST_FIELDS: { key: string; label: string; fields: { key: keyof Q
       { key: 'txQuoteHost', label: '快照域名（GBK）', hint: '个股/ETF/指数/美股批量报价' },
       { key: 'txListHost', label: '排行域名', hint: 'A 股成交额榜，降级时的池子来源' },
       { key: 'txHistHost', label: '分时域名', hint: '当日分钟线' },
-      { key: 'txKlineHost', label: '日 K 域名', hint: '蜡烛图；美股必须带交易所后缀' },
+      { key: 'txKlineHost', label: 'K 线域名', hint: '蜡烛图；美股必须带交易所后缀' },
     ],
   },
   {
@@ -165,13 +207,13 @@ const PROVIDER_HOST_FIELDS: { key: string; label: string; fields: { key: keyof Q
     fields: [
       { key: 'sinaQuoteHost', label: '快照域名（GBK）', hint: '个股/ETF/指数批量报价' },
       { key: 'sinaListHost', label: '排行域名', hint: '每页 80 条，分页取' },
-      { key: 'sinaHistHost', label: '日 K 域名', hint: '字段序与东财不同，已按实测对齐' },
+      { key: 'sinaHistHost', label: 'K 线域名', hint: '只有日线，周 K 由本地合并' },
     ],
   },
 ];
 const CAP_LABEL: Record<string, string> = {
   cnStocks: '沪深个股池', cnIndexes: '沪深指数', cnEtfs: 'ETF 补价', usStocks: '美股池', usIndexes: '美股指数',
-  one: '单标的', fx: '汇率', trends: '分时', kline: '日 K', suggest: '检索',
+  one: '单标的', fx: '汇率', trends: '分时', kline: '日/周 K', suggest: '检索',
 };
 
 const ACTION_LABEL: Record<string, string> = {
@@ -230,6 +272,9 @@ export function Admin({ onExit }: { onExit: () => void }) {
   const [quoteDraft, setQuoteDraft] = useState<QuoteSource | null>(null);
   const [check, setCheck] = useState<QuoteCheck | null>(null);
   const [checking, setChecking] = useState(false);
+  const [proxyDraft, setProxyDraft] = useState<ProxyPolicy | null>(null);
+  const [proxyCheck, setProxyCheck] = useState<ProxyCheckResult | null>(null);
+  const [proxyBusy, setProxyBusy] = useState('');
   const [scopes, setScopes] = useState({ data: true, config: true, audit: true, sessions: false });
   const [doc, setDoc] = useState<BackupDocument | null>(null);
   const [picked, setPicked] = useState<{ name: string; bytes: number; document: BackupDocument } | null>(null);
@@ -270,6 +315,8 @@ export function Admin({ onExit }: { onExit: () => void }) {
         const result = await api<QuoteStatus>('admin_quote_status');
         setQuote(result);
         setQuoteDraft(result.source);
+        setProxyDraft(result.proxy?.settings ?? null);
+        setProxyCheck(null);
       }
     } catch (error) {
       toast.error(error instanceof ApiError ? error.message : '后台数据读取失败');
@@ -870,6 +917,198 @@ export function Admin({ onExit }: { onExit: () => void }) {
                 className="num h-8 rounded border border-hairline bg-panel px-2 text-[0.75rem] outline-none focus:border-input" />
               <span className="num text-[0.6875rem] text-ink-dim">当前 {quoteDraft.etfs.length} 条 · 默认 {quote.defaults.etfs.length} 条</span>
             </label>
+
+            {proxyDraft && quote.proxy ? (
+              <section className="flex flex-col gap-2 rounded border border-hairline bg-raised p-3">
+                <div className="flex flex-wrap items-center gap-2">
+                  <h3 className="text-[0.6875rem] tracking-[0.08em] text-primary">代理出口（防限流）</h3>
+                  <span className={`chip num ${proxyDraft.enabled ? 'border-down/40 bg-down/12 text-down' : 'border-hairline text-ink-dim'}`}>
+                    {proxyDraft.enabled ? '已启用' : '未启用'} · {proxyDraft.mode === 'proxy_only' ? '一律走代理' : '直连优先'}
+                  </span>
+                  <span className="chip num border-hairline text-ink-dim">
+                    池子 {quote.proxy.status.alive}/{quote.proxy.status.pool.length} 可用
+                    {quote.proxy.status.counters.lastVia ? ` · 最近出口 ${quote.proxy.status.counters.lastVia}` : ''}
+                  </span>
+                  {quote.proxy.status.direct.coolingMs > 0 && (
+                    <span className="chip num border-warn/50 bg-warn/12 text-warn">直连冷却中 {Math.round(quote.proxy.status.direct.coolingMs / 1000)}s</span>
+                  )}
+                  {quote.proxy.lastCheck && !proxyCheck && (
+                    <span className="num text-[0.6875rem] text-ink-dim">上次检测 {clockTime(quote.proxy.lastCheck.at)} · {quote.proxy.lastCheck.okCount}/{quote.proxy.lastCheck.total} 可用</span>
+                  )}
+                </div>
+
+                {quote.proxy.runtime !== 'node' && (
+                  <p className="rounded border border-warn/50 bg-warn/10 px-2 py-1.5 text-[0.75rem] leading-5 text-warn">
+                    当前运行时不支持代理：CONNECT 隧道要原始套接字，只有自建部署（<span className="num">node server/index.mjs</span>）能装。
+                    配置照样能存，换成自建实例后直接生效。
+                  </p>
+                )}
+
+                <label className="flex items-center gap-2 text-xs">
+                  <input type="checkbox" className="mt-1 accent-[var(--primary)]" checked={proxyDraft.enabled}
+                    onChange={(event) => setProxyDraft({ ...proxyDraft, enabled: event.target.checked })} aria-label="启用代理" />
+                    <span>启用代理<span className="ml-1 text-[0.6875rem] text-ink-dim">关掉就是现在的行为：只走直连，一个代理包都不发</span></span>
+                </label>
+
+                <div className="grid gap-2 sm:grid-cols-2">
+                  <label className="flex flex-col gap-1.5 rounded border border-hairline bg-panel px-3 py-2 text-xs">
+                    <span>出口策略<span className="ml-1 text-[0.6875rem] text-ink-dim">直连优先：只在直连失败或被限流时换出口</span></span>
+                    <select value={proxyDraft.mode} aria-label="出口策略"
+                      onChange={(event) => setProxyDraft({ ...proxyDraft, mode: event.target.value })}
+                      className="num h-8 rounded border border-hairline bg-panel px-1 text-[0.75rem] outline-none focus:border-input">
+                      <option value="direct_first">直连优先，失败才用代理</option>
+                      <option value="proxy_only">一律走代理</option>
+                    </select>
+                  </label>
+                  <label className="flex flex-col gap-1.5 rounded border border-hairline bg-panel px-3 py-2 text-xs">
+                    <span>代理类型<span className="ml-1 text-[0.6875rem] text-ink-dim">向列表 API 要哪一种；手动填的地址也按这个握手</span></span>
+                    <select value={proxyDraft.protocol} aria-label="代理类型"
+                      onChange={(event) => setProxyDraft({ ...proxyDraft, protocol: event.target.value })}
+                      className="num h-8 rounded border border-hairline bg-panel px-1 text-[0.75rem] outline-none focus:border-input">
+                      <option value="http">http（明文 CONNECT 隧道）</option>
+                      <option value="https">https（对代理再套一层 TLS）</option>
+                    </select>
+                  </label>
+                </div>
+
+                <label className="flex flex-col gap-1.5 rounded border border-hairline bg-panel px-3 py-2 text-xs">
+                  <span>代理列表 API<span className="ml-1 text-[0.6875rem] text-ink-dim">只收 https，不能带账号口令；请求时会自动补 count 与 protocol</span></span>
+                  <input value={proxyDraft.apiUrl} aria-label="代理列表 API" placeholder={quote.proxy.defaults.apiUrl}
+                    onChange={(event) => setProxyDraft({ ...proxyDraft, apiUrl: event.target.value })}
+                    className="num h-8 rounded border border-hairline bg-panel px-2 text-[0.75rem] outline-none focus:border-input" />
+                  <span className="num text-[0.6875rem] text-ink-dim">
+                    备份与审计里记的是 {quote.proxy.status.policy.apiUrl || '（未填）'}
+                    {quote.proxy.status.counters.lastPullAt ? ` · 上次取列表 ${clockTime(quote.proxy.status.counters.lastPullAt)}` : ' · 还没取过列表'}
+                    {quote.proxy.status.counters.lastPullError ? ` · ${quote.proxy.status.counters.lastPullError}` : ''}
+                  </span>
+                </label>
+
+                {(quote.proxy.presets ?? []).length > 0 && (
+                  <div className="flex flex-wrap items-center gap-1.5 text-[0.6875rem]">
+                    <span className="text-ink-dim">内置接口</span>
+                    {(quote.proxy.presets ?? []).map((preset) => (
+                      <button key={preset.key} type="button" title={`${preset.note} · ${preset.docs}`}
+                        onClick={() => setProxyDraft({ ...proxyDraft, apiUrl: preset.url })}
+                        className={`chip num border px-1.5 py-0.5 transition-colors duration-75 active:translate-y-px ${proxyDraft.apiUrl === preset.url
+                          ? 'border-primary/55 bg-primary/12 text-primary' : 'border-hairline text-ink-dim hover:bg-surface-2 hover:text-foreground'}`}>
+                        {preset.label}
+                      </button>
+                    ))}
+                    <span className="text-ink-dim">免注册免凭据，返回 <span className="num">data.proxies</span> 里的 ip:port；点一下就填进上面</span>
+                  </div>
+                )}
+
+                <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
+                  {PROXY_FIELDS.map((field) => (
+                    <Field key={field.key} label={field.label} hint={field.hint}
+                      value={Number(proxyDraft[field.key] ?? 0)}
+                      onChange={(value) => setProxyDraft({ ...proxyDraft, [field.key]: Math.round(value) })} />
+                  ))}
+                </div>
+
+                <label className="flex flex-col gap-1.5 rounded border border-hairline bg-panel px-3 py-2 text-xs">
+                  <span>手动代理<span className="ml-1 text-[0.6875rem] text-ink-dim">逗号或空格分隔的 host:port，最多 20 个；这些地址永远排在最前面用</span></span>
+                  <input value={proxyDraft.manual.join(', ')} aria-label="手动代理" placeholder="203.0.113.9:8080, 198.51.100.7:3128"
+                    onChange={(event) => setProxyDraft({ ...proxyDraft, manual: event.target.value.split(/[,，\s]+/).filter(Boolean) })}
+                    className="num h-8 rounded border border-hairline bg-panel px-2 text-[0.75rem] outline-none focus:border-input" />
+                  <span className="num text-[0.6875rem] text-ink-dim">当前 {proxyDraft.manual.length} 条 · 带账号口令或指向内网的地址会被逐项拒绝</span>
+                </label>
+
+                <div className="flex flex-wrap items-center gap-2">
+                  <MiniButton armedKey="proxy-save" pending={pending} text="保存代理配置" armed="确认保存" kind="primary"
+                    onFire={() => act('proxy-save', () => api('admin_settings', { patch: { proxy: proxyDraft }, confirm: true }), '代理配置已保存并立即生效')} />
+                  <MiniButton armedKey="" pending="" text="立即获取新代理" disabled={Boolean(proxyBusy) || !proxyDraft.apiUrl}
+                    onFire={async () => {
+                      setProxyBusy('pull');
+                      try {
+                        const result = await api<ProxyPull>('admin_proxy_pull', { force: true });
+                        setProxyCheck(null);
+                        toast.success(result.added ? `已取回 ${result.added} 个代理，池子 ${result.pool} 个` : `没取到新代理：${result.error ?? '列表为空'}`);
+                        void load('quote', query);
+                      } catch (error) {
+                        toast.error(error instanceof ApiError ? error.message : '获取代理失败');
+                      } finally { setProxyBusy(''); }
+                    }} />
+                  <MiniButton armedKey="" pending="" text="逐代理活性检测" disabled={Boolean(proxyBusy)}
+                    onFire={async () => {
+                      setProxyBusy('check');
+                      try {
+                        setProxyCheck(await api<ProxyCheckResult>('admin_proxy_check'));
+                        toast.success('代理检测完成');
+                      } catch (error) {
+                        toast.error(error instanceof ApiError ? error.message : '代理检测失败');
+                      } finally { setProxyBusy(''); }
+                    }} />
+                  {proxyBusy && <span className="text-[0.75rem] text-ink-dim">{proxyBusy === 'pull' ? '正在取列表…' : '正在逐个试出口…'}</span>}
+                  <MiniButton armedKey="proxy-reset" pending={pending} text="恢复默认代理配置" armed="确认恢复"
+                    onFire={() => act('proxy-reset', () => api('admin_settings', { patch: { proxy: quote.proxy!.defaults }, confirm: true }), '已恢复默认代理配置')} />
+                  <span className="text-[0.6875rem] text-ink-dim">取列表每分钟最多 6 次，检测最多 12 次</span>
+                </div>
+
+                {proxyCheck && (
+                  <div className="overflow-x-auto">
+                    <table className="w-full min-w-[42rem] border-collapse text-[0.8125rem]">
+                      <thead>
+                        <tr className="border-b border-hairline text-left text-[0.6875rem] text-ink-dim">
+                          {['代理地址', '结果', '耗时', '条数', '说明'].map((head) => <th key={head} className="px-2 py-1 font-normal">{head}</th>)}
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {proxyCheck.results.map((row) => (
+                          <tr key={row.addr} className="border-b border-hairline/40">
+                            <td className="num px-2 py-1.5">{row.addr}</td>
+                            <td className="px-2"><Badge text={row.ok ? '可用' : row.blocked ? '已被封' : '不可用'} kind={row.ok ? 'down' : 'up'} /></td>
+                            <td className={`num px-2 text-right ${row.ms > 1500 ? 'text-warn' : ''}`}>{row.ms}ms</td>
+                            <td className="num px-2 text-right">{row.rows ?? '—'}</td>
+                            <td className="num max-w-[20rem] truncate px-2 text-[0.75rem] text-up" title={row.error ?? ''}>{row.error || '—'}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+
+                {quote.proxy.status.pool.length > 0 ? (
+                  <div className="overflow-x-auto">
+                    <table className="w-full min-w-[46rem] border-collapse text-[0.8125rem]">
+                      <thead>
+                        <tr className="border-b border-hairline text-left text-[0.6875rem] text-ink-dim">
+                          {['代理地址', '来源', '状态', '连挂', '成功', '最近耗时', '最近错误'].map((head) => <th key={head} className="px-2 py-1 font-normal">{head}</th>)}
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {quote.proxy.status.pool.map((row) => (
+                          <tr key={row.addr} className="border-b border-hairline/40">
+                            <td className="num px-2 py-1.5">{row.addr}{row.pinned && <span className="ml-1 text-[0.6875rem] text-primary">钉住</span>}</td>
+                            <td className="px-2 text-[0.75rem] text-ink-dim">{row.source === 'manual' ? '手动' : '列表 API'}</td>
+                            <td className="px-2">
+                              <Badge text={row.blocked ? '已被封' : row.usable ? '可用' : '待剔除'} kind={row.usable && !row.blocked ? 'down' : 'up'} />
+                            </td>
+                            <td className="num px-2 text-right">{row.fails}</td>
+                            <td className="num px-2 text-right">{row.ok}</td>
+                            <td className="num px-2 text-right">{row.lastMs === null ? '—' : `${row.lastMs}ms`}</td>
+                            <td className="num max-w-[18rem] truncate px-2 text-[0.75rem] text-up" title={row.lastError ?? ''}>{row.lastError || '—'}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                ) : (
+                  <p className="text-[0.75rem] text-ink-dim">池子是空的：填好列表 API 或手动地址后，点「立即获取新代理」才会有出口。</p>
+                )}
+
+                {proxyCheck?.advice.length ? (
+                  <ul className="space-y-1 text-[0.75rem] leading-5 text-ink-dim">
+                    {proxyCheck.advice.map((line) => <li key={line} className="border-l border-warn/50 pl-2">{line}</li>)}
+                  </ul>
+                ) : null}
+
+                <p className="text-[0.75rem] leading-6 text-ink-dim">
+                  活性检测真打一次行情接口：连得上但取不到行情的代理判「不可用」，被上游回 403/407 的判「已被封」并立即剔除，
+                  下一次请求会自动去取新列表。换出口只改「怎么出去」，域名白名单、当日判定与记账口径一概不变。
+                </p>
+              </section>
+            ) : null}
 
             <div className="flex flex-wrap items-center gap-2">
               <MiniButton armedKey="quote-save" pending={pending} text="保存行情源配置" armed="确认保存" kind="primary"

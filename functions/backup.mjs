@@ -3,6 +3,7 @@
 // 否则一个改过的 JSON 就能往任意字段写任意值。
 // 本文件不碰文件系统、不碰 HTTP：运行时差异由 client 的能力（withTx / execute）决定。
 import { MICRO, START_CASH, START_CASH_USD } from './rules.mjs';
+import { PROXY_SETTING_KEY, maskProxyValue } from './proxy.mjs';
 
 export const BACKUP_FORMAT = 'mirrordesk-backup';
 export const BACKUP_VERSION = 1;
@@ -197,7 +198,7 @@ async function readTable(client, name) {
 /**
  * 导出整库。默认全站数据 + 配置 + 审计，不含会话摘要。只读，任何运行时都能跑。
  */
-export async function exportBackup(client, { include = {}, now = new Date(), meta = {} } = {}) {
+export async function exportBackup(client, { include = {}, now = new Date(), meta = {}, proxyPlain = false } = {}) {
   const scope = { data: true, config: true, audit: true, sessions: false, ...include };
   for (const key of Object.keys(scope)) {
     if (!(key in SCOPES)) throw new Error(`unknown_scope:${key}`);
@@ -211,6 +212,17 @@ export async function exportBackup(client, { include = {}, now = new Date(), met
     tables[name] = list;
     rows += list.length;
   }
+  // 代理配置默认打码：那串 API 地址常常就是一次性凭证，备份文件是要被人拿到别处去的。
+  // 只留开关与参数，路径与查询串抹掉；想连地址一起带走，得显式传 proxyPlain。
+  let proxyMasked = false;
+  if (!proxyPlain && tables.settings) {
+    for (const row of tables.settings) {
+      if (row.key !== PROXY_SETTING_KEY) continue;
+      const masked = maskProxyValue(row.value);
+      row.value = JSON.stringify(masked.proxy);
+      proxyMasked = true;
+    }
+  }
   if (rows > MAX_EXPORT_ROWS) throw new Error(`too_many_rows:${rows}`);
   const counts = Object.fromEntries(Object.entries(tables).map(([name, list]) => [name, list.length]));
   const document = {
@@ -223,6 +235,7 @@ export async function exportBackup(client, { include = {}, now = new Date(), met
       scopes: Object.entries(scope).filter(([, on]) => on).map(([key]) => key),
       by: meta.by ?? null,
       reason: meta.reason ?? null,
+      proxy_masked: proxyMasked || undefined,
     },
     rows,
     counts,
@@ -320,6 +333,14 @@ export async function inspectBackup(document) {
   if (tables.sessions?.length) warnings.push('文件包含会话摘要：导入后旧实例上已登录的浏览器会在新实例继续有效。');
   else warnings.push('文件不含会话：导入完成后所有人都要重新登录（包括你自己）。');
   if (!tables.audit?.length) warnings.push('文件不含审计流水：本机已有审计会原样保留，导入只追加新记录。');
+  // 备份不带代理 API 地址（那串常是一次性凭证）：不写清楚，运维会以为代理功能坏了
+  const proxyRow = (tables.settings ?? []).find((row) => row.key === PROXY_SETTING_KEY);
+  const proxyConfigured = proxyRow && /"enabled"\s*:\s*true/.test(String(proxyRow.value ?? ''));
+  if (document?.meta?.proxy_masked === true || (proxyRow && !/"apiUrl"\s*:\s*"http/.test(String(proxyRow.value ?? '')))) {
+    warnings.push(proxyConfigured
+      ? '文件里没带代理列表 API 地址（导出时按凭证处理）：这台机器开着代理，导入后必须重新填地址，否则取不到新代理。'
+      : '文件里没带代理列表 API 地址（导出时按凭证处理）：要用的话在后台重新填一次。');
+  }
 
   return {
     ok: problems.length === 0,

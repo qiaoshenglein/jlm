@@ -74,6 +74,21 @@ try {
   await page.waitForTimeout(2_500);
   await page.screenshot({ path: join(OUT, 'desk-chart.png') });
 
+  // 日 K / 周 K + MACD 副图：十字线停在图上，读数框里要能看到 DIF/DEA/柱
+  await page.getByRole('button', { name: '日 K', exact: true }).click();
+  await page.waitForTimeout(2_500);
+  const chartBox = await page.locator('svg[role="img"][aria-label*="K 线"]').boundingBox();
+  await page.mouse.move(chartBox.x + chartBox.width * 0.62, chartBox.y + chartBox.height * 0.3);
+  await page.waitForTimeout(400);
+  await page.screenshot({ path: join(OUT, 'chart-daily-macd.png') });
+  await page.getByRole('button', { name: '周 K', exact: true }).click();
+  await page.waitForTimeout(2_500);
+  await page.mouse.move(chartBox.x + chartBox.width * 0.62, chartBox.y + chartBox.height * 0.3);
+  await page.waitForTimeout(400);
+  await page.screenshot({ path: join(OUT, 'chart-weekly-macd.png') });
+  await page.getByRole('button', { name: '分时', exact: true }).click();
+  await page.waitForTimeout(900);
+
   await page.getByRole('button', { name: '疏' }).click();
   await page.waitForTimeout(600);
   await page.screenshot({ path: join(OUT, 'desk-roomy.png') });

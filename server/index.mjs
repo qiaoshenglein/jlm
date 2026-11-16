@@ -7,6 +7,7 @@ import { dirname, extname, join, normalize, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createDb } from './db.mjs';
 import { createBackupFiles } from './backups.mjs';
+import { installProxyTransport } from './proxy.mjs';
 import { handle } from '../functions/api.mjs';
 import { Store } from '../functions/store.mjs';
 import { adminNames, ensureAdmins } from '../functions/admin.mjs';
@@ -76,6 +77,10 @@ const log = (line) => console.log(new Date().toISOString(), line);
 // 导入前快照：整库覆盖是唯一的不可逆操作，落不下去就不允许执行。
 // 只保留最近 BACKUP_KEEP 份，目录由 BACKUP_DIR 指定（默认 data/backups）。
 const backupFiles = createBackupFiles({ dir: BACKUP_DIR, keep: BACKUP_KEEP });
+
+// 行情出网接缝：换成「直连优先、失败再走代理」的实现。
+// 开关默认关着，没开代理时这一层和 globalThis.fetch 的行为一致。
+installProxyTransport();
 
 // 后台引导：ADMIN_USERNAMES 里已注册的账户立刻标为 admin；还没注册的，等其注册后由首次后台请求补上
 const adminBoot = await ensureAdmins(new Store(db));

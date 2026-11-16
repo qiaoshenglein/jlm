@@ -3,6 +3,7 @@
 // 约定二：右侧固定留出价格轴栏，十字线读数永远画在画布内。
 import { useEffect, useRef, useState } from 'react';
 import { Y, priceText, type Quote } from '../format';
+import { macd, type MacdPoint } from '../indicators';
 
 const UP = 'var(--up)';
 const DOWN = 'var(--down)';
@@ -79,10 +80,9 @@ function PriceTag({ width, limit, y, text, color }: {
   );
 }
 
-function Readout({ x, right, y, lines, accent }: {
-  x: number; right: number; y: number; lines: string[]; accent: string;
+function Readout({ x, right, y, lines, accent, boxW = 132 }: {
+  x: number; right: number; y: number; lines: string[]; accent: string; boxW?: number;
 }) {
-  const boxW = 132;
   const boxH = lines.length * 14 + 10;
   const left = x + boxW + 16 > right ? Math.max(2, x - boxW - 10) : x + 10;
   const top = Math.max(2, Math.min(y - boxH / 2, 180));
@@ -204,7 +204,9 @@ export function TrendChart({ points, prevClose, quote, markers }: {
 
 type Bar = { day: string; open: number; close: number; high: number; low: number; volume: number };
 
-export function CandleChart({ bars, markers }: { bars: Bar[]; markers?: Marker[] | null; height?: number }) {
+export function CandleChart({ bars, markers, period = 'day' }: {
+  bars: Bar[]; markers?: Marker[] | null; period?: 'day' | 'week';
+}) {
   const [ref, size] = useSize({ width: 720, height: 210 });
   const [hover, setHover] = useState<number | null>(null);
   const { width, height } = size;
@@ -214,9 +216,12 @@ export function CandleChart({ bars, markers }: { bars: Bar[]; markers?: Marker[]
   }
   const plotW = Math.max(40, width - AXIS_W);
   const shown = bars.slice(-Math.max(20, Math.floor(plotW / 9)));
-  const priceH = Math.round(height * 0.68);
-  const volTop = priceH + 10;
-  const volH = Math.max(12, height - volTop - 16);
+  // 三段高度：价格 / 成交量 / MACD
+  const priceH = Math.round(height * 0.54);
+  const volTop = priceH + 8;
+  const volH = Math.max(10, Math.round(height * 0.13));
+  const macdTop = volTop + volH + 14;
+  const macdH = Math.max(16, height - macdTop - 16);
   const { low, high } = bounds(shown.flatMap((b) => [b.high, b.low]), 0.05);
   const slot = plotW / shown.length;
   const y = (value: number) => priceH - ((value - low) / (high - low || 1)) * priceH;
@@ -228,11 +233,24 @@ export function CandleChart({ bars, markers }: { bars: Bar[]; markers?: Marker[]
   const tick = Math.abs(last.close % 1000) === 0 && last.close > 10 * Y ? 10_000 : last.close < 10 * Y ? 1_000 : 10_000;
   const active = hover === null ? null : shown[hover];
   const cost = markers?.find((marker) => marker.tone !== 'liq');
+  // MACD 按全部 bars 递推、只截尾显示：EMA 需要预热，先截后算的头几根会和看盘软件对不上
+  const ind = macd(bars.map((bar) => bar.close / Y)).slice(-shown.length);
+  const macdMax = Math.max(...ind.flatMap((point) => [point.dif, point.dea, point.hist])
+    .filter(Number.isFinite).map(Math.abs), 1e-6);
+  const zeroY = macdTop + macdH / 2;
+  const my = (value: number) => zeroY - ((Number.isFinite(value) ? value : 0) / macdMax) * (macdH / 2 - 2);
+  const macdPath = (pick: (point: MacdPoint) => number) => ind
+    .map((point, i) => `${i === 0 ? 'M' : 'L'}${(i * slot + slot / 2).toFixed(1)},${my(pick(point)).toFixed(1)}`)
+    .join('');
+  const spanLabel = period === 'week' ? '周' : '个交易日';
+  const activeInd = hover === null ? null : ind[hover];
+  // MACD 的量级差得远（茅台几十、ETF 零点几），小数位跟着走，否则读出来全是 0.00
+  const mv = (value: number) => (Number.isFinite(value) ? (Math.abs(value) < 0.1 ? value.toFixed(3) : value.toFixed(2)) : '—');
 
   return (
     <div ref={ref} className="h-full w-full">
       <svg width={width} height={height} viewBox={`0 0 ${width} ${height}`} role="img"
-        aria-label={`日 K 线，共 ${shown.length} 个交易日，最新 ${priceText(last.close, tick)}`}
+        aria-label={`${period === 'week' ? '周' : '日'} K 线，共 ${shown.length} ${spanLabel}，最新 ${priceText(last.close, tick)}，MACD DIF ${mv(ind[ind.length - 1]?.dif ?? 0)}`}
         onPointerMove={(event) => setHover(Math.max(0, Math.min(shown.length - 1, Math.floor(offsetX(event) / slot))))}
         onPointerLeave={() => setHover(null)}>
         {[0.16, 0.42, 0.68, 0.9].map((f) => (
@@ -247,6 +265,9 @@ export function CandleChart({ bars, markers }: { bars: Bar[]; markers?: Marker[]
           const bodyHeight = Math.max(1, y(Math.min(bar.open, bar.close)) - bodyTop);
           const wide = slot > 4;
           const volumeH = Math.max(1, (bar.volume / maxVolume) * volH);
+          const point = ind[index];
+          const histTop = Math.min(my(point.hist), zeroY);
+          const histH = Math.max(1, Math.abs(my(point.hist) - zeroY));
           return (
             <g key={bar.day} opacity={hover !== null && hover !== index ? 0.55 : 1}>
               <line x1={cx} x2={cx} y1={y(bar.high)} y2={y(bar.low)} stroke={tone} strokeWidth={wide ? 1 : 0.8} />
@@ -258,10 +279,22 @@ export function CandleChart({ bars, markers }: { bars: Bar[]; markers?: Marker[]
               )}
               <rect x={index * slot + slot * 0.2} y={volTop + volH - volumeH} width={Math.max(1, slot * 0.6)}
                 height={volumeH} fill={tone} opacity={0.34} />
+              <rect x={index * slot + slot * 0.2} y={histTop} width={Math.max(1, slot * 0.6)} height={histH}
+                fill={point.hist >= 0 ? UP : DOWN} opacity={0.8} />
             </g>
           );
         })}
         <line x1={0} x2={plotW} y1={volTop + volH} y2={volTop + volH} stroke={HAIR} />
+        <line x1={0} x2={plotW} y1={zeroY} y2={zeroY} stroke={HAIR} strokeDasharray="3 5" />
+        <path d={macdPath((point) => point.dif)} fill="none" stroke="var(--info)" strokeWidth={1.25} />
+        <path d={macdPath((point) => point.dea)} fill="none" stroke="var(--primary)" strokeWidth={1.25} />
+        <text x={2} y={macdTop - 3} fill={DIM} fontSize={10.5}>
+          MACD 12/26/9　<tspan fill="var(--info)">DIF {mv(ind[ind.length - 1]?.dif ?? Number.NaN)}</tspan>
+          <tspan fill="var(--primary)">　DEA {mv(ind[ind.length - 1]?.dea ?? Number.NaN)}</tspan>
+          <tspan fill={((ind[ind.length - 1]?.hist ?? 0) >= 0 ? UP : DOWN)}>　柱 {mv(ind[ind.length - 1]?.hist ?? Number.NaN)}</tspan>
+        </text>
+        <text x={plotW + 8} y={macdTop + 9} fill={DIM} fontSize={10}>{macdMax.toFixed(2)}</text>
+        <text x={plotW + 8} y={macdTop + macdH - 1} fill={DIM} fontSize={10}>{(-macdMax).toFixed(2)}</text>
         <line x1={0} x2={plotW} y1={y(last.close)} y2={y(last.close)} stroke={color} strokeDasharray="4 3" opacity={0.75} />
         {(markers ?? []).map((marker) => (
           <RefLine key={marker.label} price={marker.price} label={marker.label} plotW={plotW} y={y}
@@ -271,13 +304,15 @@ export function CandleChart({ bars, markers }: { bars: Bar[]; markers?: Marker[]
         <PriceTag width={width} limit={priceH} y={y(last.close)} text={priceText(last.close, tick)} color={color} />
         {active && (
           <g>
-            <line x1={(hover ?? 0) * slot + slot / 2} x2={(hover ?? 0) * slot + slot / 2} y1={0} y2={volTop + volH}
+            <line x1={(hover ?? 0) * slot + slot / 2} x2={(hover ?? 0) * slot + slot / 2} y1={0} y2={macdTop + macdH}
               stroke="var(--foreground)" opacity={0.4} />
-            <Readout x={(hover ?? 0) * slot + slot / 2} right={plotW} y={y(active.close)} accent={color}
+            <circle cx={(hover ?? 0) * slot + slot / 2} cy={my(activeInd?.dif ?? Number.NaN)} r={2.4} fill="var(--info)" />
+            <Readout x={(hover ?? 0) * slot + slot / 2} right={plotW} y={y(active.close)} accent={color} boxW={172}
               lines={[
                 `${active.day.slice(5)}  收 ${priceText(active.close, tick)}`,
                 `开 ${priceText(active.open, tick)}  高 ${priceText(active.high, tick)}`,
                 `低 ${priceText(active.low, tick)}  量 ${(active.volume / 1e4).toFixed(1)}万`,
+                `DIF ${mv(activeInd?.dif ?? Number.NaN)}  DEA ${mv(activeInd?.dea ?? Number.NaN)}  柱 ${mv(activeInd?.hist ?? Number.NaN)}`,
                 ...(cost ? [`成本 ${priceText(cost.price / Y, tick)} 处 ${(((active.close - cost.price / Y) / (cost.price / Y || 1)) * 100).toFixed(1)}%`] : []),
               ]} />
           </g>

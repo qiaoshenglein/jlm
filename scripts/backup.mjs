@@ -1,6 +1,7 @@
 // 命令行整库备份：不经过 HTTP，大库恢复与 cron 归档走这条路最稳。
 // 用法：
-//   node scripts/backup.mjs export [--out 路径] [--only-config] [--with-sessions] [--no-audit]
+//   node scripts/backup.mjs export [--out 路径] [--only-config] [--with-sessions] [--no-audit] [--proxy-plain]
+// 代理列表 API 的地址默认打码导出（那串 URL 常常就是凭证）；要原样带走加 --proxy-plain。
 //   node scripts/backup.mjs preview <备份文件>
 //   node scripts/backup.mjs import <备份文件> [--mode replace|config] [--yes] [--no-snapshot]
 // 数据库连接沿用服务的环境变量：DB_DRIVER / DB_PATH / DATABASE_URL / DB_SCHEMA。
@@ -23,7 +24,7 @@ const flag = (name, fallback = null) => {
 };
 
 const USAGE = `用法：
-  node scripts/backup.mjs export [--out 路径] [--only-config] [--with-sessions] [--no-audit]
+  node scripts/backup.mjs export [--out 路径] [--only-config] [--with-sessions] [--no-audit] [--proxy-plain]
   node scripts/backup.mjs preview <备份文件>
   node scripts/backup.mjs import <备份文件> [--mode replace|config] [--yes] [--no-snapshot]`;
 
@@ -50,7 +51,10 @@ if (command === 'export') {
     audit: !has('no-audit'),
     sessions: has('with-sessions'),
   };
-  const document = await exportBackup(db, { include, meta: { driver: db.driver, schema: db.schema ?? null, by: 'cli' } });
+  const document = await exportBackup(db, {
+    include, proxyPlain: has('proxy-plain'),
+    meta: { driver: db.driver, schema: db.schema ?? null, by: 'cli' },
+  });
   const out = resolve(ROOT, flag('out') ?? join(files.dir, `export-${document.created_at.replace(/[:.]/g, '-').slice(0, 19)}.json`));
   await mkdir(dirname(out), { recursive: true });
   await writeFile(out, JSON.stringify(document), 'utf8');

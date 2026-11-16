@@ -9,6 +9,9 @@ import {
 import { replay, startCashOf, tradesOf } from './ledger.mjs';
 import { newId } from './auth.mjs';
 import { applyBackup, exportBackup, inspectBackup, planBackup } from './backup.mjs';
+import {
+  PROXY_API_PRESETS, PROXY_DEFAULTS, checkProxyPolicy, maskApiUrl, proxyPolicy, proxyRuntime, proxyStatus, setProxyPolicy,
+} from './proxy.mjs';
 
 // 只允许「改了只影响未来」的键。开户本金的历史账户值冻结在 users.start_cash / start_cash_usd 里，
 // 这里改的是「新账户默认值」，不会重写任何已存在的账本；已落库的成交与费用永不重算。
@@ -22,6 +25,7 @@ export const SETTINGS_DEFAULTS = {
   params: DEFAULT_PARAMS,
   us_params: DEFAULT_PARAMS_US,
   quote_source: QUOTE_SOURCE_DEFAULTS,
+  proxy: PROXY_DEFAULTS,
 };
 
 const SETTING_KEYS = Object.keys(SETTINGS_DEFAULTS);
@@ -30,7 +34,7 @@ const CASH_KEYS = { start_cash: true, start_cash_usd: true };
 // 挂牌参数按市场分列存储：改美股费用不会碰 A 股，反之亦然
 const PARAM_KEYS = { params: 'cn', us_params: 'us' };
 // JSON 结构体配置：写入前都要过各自的校验器，落库的值一定是合法值
-const JSON_KEYS = { params: 'cn', us_params: 'us', quote_source: 'source' };
+const JSON_KEYS = { params: 'cn', us_params: 'us', quote_source: 'source', proxy: 'proxy' };
 const DEFAULTS_OF = { cn: DEFAULT_PARAMS, us: DEFAULT_PARAMS_US };
 const MAX_GRANT_MICRO = 1_000_000_000 * MICRO; // 单笔调整上限 10 亿（虚拟资金，防误操作）
 const CHECKS_PER_MINUTE = 12;
@@ -79,6 +83,15 @@ function decode(key, raw) {
       return { ...QUOTE_SOURCE_DEFAULTS, etfs: [...QUOTE_SOURCE_DEFAULTS.etfs] };
     }
   }
+  if (key === 'proxy') {
+    // API 地址可能是「一次性」的带 key 链接，库里存的就是原文；打码只发生在备份与审计这两处
+    try {
+      const parsed = JSON.parse(text);
+      return checkProxyPolicy(parsed && typeof parsed === 'object' ? parsed : {}).values;
+    } catch {
+      return { ...PROXY_DEFAULTS, manual: [...PROXY_DEFAULTS.manual] };
+    }
+  }
   return clampText(text, 32);
 }
 
@@ -106,6 +119,8 @@ export async function readSettingsCached(store, ttl = 2_000) {
   setParams(values.us_params, 'us');
   // 行情源同理：设置里存的就是引擎实际在用的域名与 TTL
   setQuoteSource(values.quote_source);
+  // 代理策略也回灌一份：出网接缝在自建入口那边，它每个请求都读这份当前值
+  setProxyPolicy(values.proxy);
   settingsCache.at = now;
   settingsCache.values = values;
   return values;
@@ -175,6 +190,9 @@ function throttledHere(key, limit, windowMs, nowMs) {
 
 const MARKET_LABEL = { cn: '沪深', us: '美股' };
 let lastQuoteCheck = null;
+let lastProxyCheck = null;
+// 拉一次列表就是打一次第三方 API，还会计费：单独一档限频，比检测更严
+const PULLS_PER_MINUTE = 6;
 
 // 概览只带够判断「行情是否正常」的几个字段，不搬运整个健康度对象
 const pickHealth = (item) => ({
@@ -383,7 +401,7 @@ export async function runAdmin({ store, action, admin, body, nowMs, today, ip, f
       if (body.confirm !== true) throw fail('confirm_required', 400);
       const patch = body.patch;
       const before = await readSettings(store);
-      const next = { ...before, params: { ...before.params }, us_params: { ...before.us_params }, quote_source: { ...before.quote_source, etfs: [...before.quote_source.etfs] } };
+      const next = { ...before, params: { ...before.params }, us_params: { ...before.us_params }, quote_source: { ...before.quote_source, etfs: [...before.quote_source.etfs] }, proxy: { ...before.proxy, manual: [...before.proxy.manual] } };
       for (const key of ['register_enabled', 'invite_code', 'start_cash', 'start_cash_usd', 'match_paused', 'match_paused_us']) {
         if (patch[key] === undefined) continue;
         let value = patch[key];
@@ -423,6 +441,12 @@ export async function runAdmin({ store, action, admin, body, nowMs, today, ip, f
         if (rejected.length) throw fail('param_invalid', 400, { rejected });
         next.quote_source = values;
       }
+      // 代理：地址与端口逐项校验，指向内网/带凭据的直接拒绝——这一项能把出网指到别处
+      if (patch.proxy && typeof patch.proxy === 'object') {
+        const { values, rejected } = checkProxyPolicy({ ...next.proxy, ...patch.proxy });
+        if (rejected.length) throw fail('param_invalid', 400, { rejected });
+        next.proxy = values;
+      }
       for (const key of SETTING_KEYS) await store.setSetting(key, encode(key, next[key]), admin.id, stamp);
       invalidateSettings();
       const after = await readSettingsCached(store, 0);
@@ -444,6 +468,14 @@ export async function runAdmin({ store, action, admin, body, nowMs, today, ip, f
         const was = before.quote_source[name];
         const now = after.quote_source[name];
         if (JSON.stringify(was) !== JSON.stringify(now)) changed[`quote_source.${name}`] = now;
+      }
+      // 代理变更同样逐项留痕，但 API 地址只写打码后的形态：
+      // 审计表会进备份、也会出现在后台列表里，不能把带 key 的链接抄成明文
+      for (const name of Object.keys(after.proxy)) {
+        const was = before.proxy[name];
+        const now = after.proxy[name];
+        if (JSON.stringify(was) === JSON.stringify(now)) continue;
+        changed[`proxy.${name}`] = name === 'apiUrl' ? maskApiUrl(now) : now;
       }
       await writeAudit(store, { admin, action, target: 'settings', detail: { changed }, ip, nowMs });
       return {
@@ -472,7 +504,55 @@ export async function runAdmin({ store, action, admin, body, nowMs, today, ip, f
       settings: { match_paused: settings.match_paused, match_paused_us: settings.match_paused_us },
       // 上一次检测的结果留在进程里：概览页要显示结论，但不该为此再打一次上游
       lastCheck: lastQuoteCheck,
+      // 代理这一块的原文只给后台自己填表用；审计与备份里是打码形态
+      proxy: {
+        settings: settings.proxy,
+        defaults: PROXY_DEFAULTS,
+        presets: PROXY_API_PRESETS,
+        status: proxyStatus(settings.proxy, nowMs),
+        runtime: proxyRuntime() ? 'node' : 'none',
+        lastCheck: lastProxyCheck,
+      },
     };
+  }
+
+  // ---- 代理：取列表 / 逐个验活 ----
+  // 只有自建进程装了隧道实现才有这套能力（边缘运行时没有原始套接字），所以先问运行时。
+  const proxyRuntimeOrNull = () => {
+    const runtime = proxyRuntime();
+    if (!runtime) throw fail('proxy_runtime_unavailable', 400, {
+      message: '当前运行时不支持代理：CONNECT 隧道要原始套接字，只有自建部署（node server/index.mjs）有。',
+    });
+    return runtime;
+  };
+
+  if (action === 'admin_proxy_pull') {
+    if (throttledHere(`proxy:${admin.id}`, PULLS_PER_MINUTE, 60_000, nowMs)) throw fail('too_many_requests', 429);
+    const settings = await readSettingsCached(store, 0);
+    const runtime = proxyRuntimeOrNull();
+    const result = await runtime.pullProxies({ force: body.force !== false });
+    await writeAudit(store, {
+      admin, action, target: 'proxy', ip, nowMs,
+      // 审计里不抄 API 地址：那串 URL 往往就是取代理的凭证
+      detail: { added: result.added ?? 0, pool: result.pool ?? 0, error: result.error ?? null, skipped: result.skipped === true },
+    });
+    return { ...result, status: proxyStatus(settings.proxy, nowMs) };
+  }
+
+  if (action === 'admin_proxy_check') {
+    if (throttledHere(`proxy:${admin.id}`, CHECKS_PER_MINUTE, 60_000, nowMs)) throw fail('too_many_requests', 429);
+    const settings = await readSettingsCached(store, 0);
+    const runtime = proxyRuntimeOrNull();
+    const result = await runtime.checkProxies();
+    lastProxyCheck = {
+      at: stamp, verdict: result.verdict, okCount: result.okCount, total: result.total,
+      slowest: result.results.reduce((max, row) => Math.max(max, row.ms ?? 0), 0),
+    };
+    await writeAudit(store, {
+      admin, action, target: 'proxy', ip, nowMs,
+      detail: { verdict: result.verdict, okCount: result.okCount, total: result.total, pulled: result.pulled?.added ?? 0 },
+    });
+    return { ...result, lastCheck: lastProxyCheck, status: proxyStatus(settings.proxy, nowMs), policy: { enabled: settings.proxy.enabled, mode: settings.proxy.mode } };
   }
 
   if (action === 'admin_quote_check') {
@@ -517,7 +597,7 @@ export async function runAdmin({ store, action, admin, body, nowMs, today, ip, f
     if (capDown('usStocks')) advice.push('所有源的美股池都取不到：美股退到上一次快照；降级时美股按持仓与自选逐个补价，没有持仓就只剩指数。');
     if (capDown('cnIndexes')) advice.push('指数全挂：顶部指数条为空，撮合不受影响。');
     if (capDown('one')) advice.push('单标的补价全挂：行情池外的标的（自选补价、按代码直查）取不到新价。');
-    if (capDown('kline')) advice.push('日 K 全挂：蜡烛图显示「暂时取不到」，撮合与账本不受影响。');
+    if (capDown('kline')) advice.push('K 线全挂：蜡烛图显示「暂时取不到」，撮合与账本不受影响。');
     if (capDown('trends')) advice.push('分时全挂：分时图显示「暂时取不到」，撮合与账本不受影响。');
     if (capDown('suggest')) advice.push('检索全挂：搜索只能命中行情池内已有标的。');
     if (capDown('fx')) advice.push('汇率全挂：合并口径沿用上次值或兜底 6.7，只影响展示，不影响记账。');
@@ -549,6 +629,8 @@ export async function runAdmin({ store, action, admin, body, nowMs, today, ip, f
     if (throttledHere(`backup:${admin.id}`, BACKUP_PER_MINUTE, 60_000, nowMs)) throw fail('too_many_requests', 429);
     const document = await exportBackup(store.sb, {
       include: pickScopes(body.include), now: new Date(nowMs),
+      // 默认打码代理地址；显式要求才原样带走（那串 URL 常常就是取代理的凭证）
+      proxyPlain: body.proxy_plain === true,
       meta: { driver: store.sb.driver ?? null, schema: store.sb.schema ?? null, by: admin.username },
     });
     // 审计里只落「谁在什么时候导出了多少行、校验和是什么」，绝不落内容

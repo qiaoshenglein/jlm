@@ -73,10 +73,12 @@ const bad = (code, status = 400, extra = null) => {
 const READ_ACTIONS = new Set(['board', 'sync', 'me', 'chart', 'leader', 'rules', 'lookup', 'search',
   'account', 'positions', 'orders', 'trades', 'markets', 'key_list',
   'admin_overview', 'admin_users', 'admin_user', 'admin_orders', 'admin_audit', 'admin_settings',
-  'admin_quote_status', 'admin_quote_check']);
+  'admin_quote_status', 'admin_quote_check', 'admin_proxy_status']);
 const WRITE_ACTIONS = new Set(['register', 'login', 'logout', 'order', 'cancel', 'preview', 'watch_add', 'watch_remove', 'watch_sort',
   'key_create', 'key_revoke',
   'admin_freeze', 'admin_unfreeze', 'admin_unlock', 'admin_revoke_sessions', 'admin_role', 'admin_grant_cash',
+  // 拉代理与检测都会真实出网（还会改进程内的代理池），按写操作对待：GET 一律拒绝
+  'admin_proxy_pull', 'admin_proxy_check',
   // 备份三个动作都要写库（导出也写审计），因此按写操作对待：GET 一律拒绝
   'admin_backup_export', 'admin_backup_preview', 'admin_backup_apply']);
 
@@ -89,7 +91,7 @@ const REST_ROUTES = [
   ['GET', '/api/v1/search', (q) => ({ action: 'search', payload: { q: q.q ?? q.query ?? '' } })],
   ['GET', '/api/v1/chart', (q) => ({
     action: 'chart',
-    payload: { symbol: q.symbol ?? q.code ?? q.secid ?? '', kind: q.kind, count: q.count },
+    payload: { symbol: q.symbol ?? q.code ?? q.secid ?? '', kind: q.kind, period: q.period, count: q.count },
   })],
   ['GET', '/api/v1/account', () => ({ action: 'account' })],
   ['GET', '/api/v1/positions', () => ({ action: 'positions' })],
@@ -430,10 +432,12 @@ async function chartAction(body, now = new Date()) {
   const secid = await resolveSecid(body.secid ?? body.symbol ?? body.code, now);
   const kind = body.kind === 'kline' ? 'kline' : 'trends';
   if (!secid) return bad('symbol_invalid');
+  // period 只对 K 线有意义：分时永远是当日逐分钟，所以那一档恒回 day，不跟着请求体走
+  const period = kind === 'kline' && body.period === 'week' ? 'week' : 'day';
   const count = Math.min(320, Math.max(30, Number(body.count) || 120));
-  const series = kind === 'kline' ? await klineOf(secid, count) : await trendsOf(secid);
+  const series = kind === 'kline' ? await klineOf(secid, count, period, now) : await trendsOf(secid);
   if (!series) return bad('chart_unavailable', 503);
-  return json({ ok: true, secid, symbol: secid.split('.')[1], kind, market: marketOfSecid(secid), series });
+  return json({ ok: true, secid, symbol: secid.split('.')[1], kind, period, market: marketOfSecid(secid), series });
 }
 
 // 折人民币口径的日结快照 → 排行榜本金也要同口径：开户时冻结的两笔本金都按当前汇率合并

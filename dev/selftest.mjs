@@ -662,10 +662,12 @@ check('每账户有效密钥上限 10 把', batch.slice(0, 10).every((row) => ro
 // ==== 行情源配置与检测 ====
 const quoteStatus1 = await call('admin_quote_status', {}, bossToken);
 check('后台能读到行情源配置与健康度', quoteStatus1.json.ok === true
-  && (quoteStatus1.json.hosts ?? []).length >= 2 && quoteStatus1.json.probes?.length === 8
+  && (quoteStatus1.json.hosts ?? []).length >= 11 && (quoteStatus1.json.probes ?? []).length >= 20
+  && (quoteStatus1.json.providers ?? []).length === 3
   && quoteStatus1.json.source?.listHost === 'push2.eastmoney.com'
+  && quoteStatus1.json.source?.sourceOrder?.join(',') === 'eastmoney,tencent,sina'
   && Boolean(quoteStatus1.json.health?.cn) && Boolean(quoteStatus1.json.health?.us),
-  `域名 ${quoteStatus1.json.hosts?.length ?? 0} 个 · 探测项 ${quoteStatus1.json.probes?.length ?? 0} 个`);
+  `域名 ${quoteStatus1.json.hosts?.length ?? 0} 个 · 探测项 ${quoteStatus1.json.probes?.length ?? 0} 个 · 源 ${(quoteStatus1.json.providers ?? []).map((x) => x.label).join('/')}`);
 
 const badHost = await call('admin_settings', { patch: { quote_source: { listHost: 'evil.example.com' } }, confirm: true }, bossToken);
 check('白名单外的域名被拒且说清哪一项', badHost.status === 400 && badHost.json.code === 'param_invalid'
@@ -686,13 +688,17 @@ check('合法的行情源改动立即生效并留痕', savedSource.json.ok === t
   `池 ${sourceAfter?.cnPoolSize} · 域名 ${sourceAfter?.listHost} · ETF ${sourceAfter?.etfs?.length} 条（非法代码已剔除）`);
 
 const checked = await call('admin_quote_check', {}, bossToken);
-const rowsOk = (checked.json.results ?? []).length === 8
-  && (checked.json.results ?? []).every((row) => typeof row.ms === 'number' && 'ok' in row);
-check('一键检测逐端点返回结果与结论', checked.json.ok === true && rowsOk
+// 检测的结论按「能力覆盖」而不是通数：东财被限流时 15/24 也可以是 ok，因为每项能力都有一家顶上
+const rowsOk = (checked.json.results ?? []).length === checked.json.total
+  && (checked.json.total ?? 0) >= 20 && (checked.json.coverage ?? []).length >= 8
+  && (checked.json.results ?? []).every((row) => typeof row.ms === 'number' && 'ok' in row && row.provider)
+  && (checked.json.verdict === 'ok' ? (checked.json.dead ?? []).length === 0 : (checked.json.dead ?? []).length > 0);
+check('一键检测逐源逐能力返回结果并按能力给结论', checked.json.ok === true && rowsOk
   && ['ok', 'partial', 'down'].includes(checked.json.verdict) && Array.isArray(checked.json.advice),
-  `结论 ${checked.json.verdict} · 可用 ${checked.json.okCount}/${checked.json.total} · 建议 ${checked.json.advice?.length ?? 0} 条`);
-const notAdminCheck = await call('admin_quote_check', {}, token);
-check('普通用户不能触发行情源检测', notAdminCheck.status === 403 && notAdminCheck.json.code === 'not_admin', notAdminCheck.json.code);
+  `结论 ${checked.json.verdict} · 可用 ${checked.json.okCount}/${checked.json.total} · 缺 ${checked.json.dead?.join(',') || '无'} · 建议 ${checked.json.advice?.length ?? 0} 条`);
+const guestToken = (await call('register', { username: 'quote_guest', password: 'probe12345', display: '普通账户' })).json.token;
+const notAdminCheck = await call('admin_quote_check', {}, guestToken);
+check('普通用户不能触发行情源检测', notAdminCheck.status === 403 && notAdminCheck.json.code === 'not_admin', `${notAdminCheck.status} ${notAdminCheck.json.code}`);
 await call('admin_settings', { patch: { quote_source: quoteStatus1.json.defaults }, confirm: true }, bossToken);
 
 // 单标的接口全挂时，A 股池不该跟着一起空掉：这里用假上游把这条容错固定住，不依赖网络状态
@@ -719,10 +725,9 @@ try {
 } finally {
   globalThis.fetch = realFetch;
 }
-check('单标的接口全挂时 A 股池仍然可用并标注降级', degraded.error !== true && degraded.size >= 20
-  && degraded.status.ok === true && /ETF 补取失败/.test(String(degraded.status.partial ?? ''))
-  && degraded.etf === null,
-  `池 ${degraded.size} 条 · partial=${degraded.status.partial ?? '无'} · note=${degraded.status.note ?? '无'}`);
+check('东财单标接口全挂时 A 股池仍可用（备用源顶上，不需要标注降级）', degraded.error !== true && degraded.size >= 20
+  && degraded.status.ok === true && degraded.etf !== null,
+  `池 ${degraded.size} 条 · 源 ${degraded.status.source} · partial=${degraded.status.partial ?? '无'} · ETF ${degraded.etf ? degraded.etf.last / 1e6 : '无'}`);
 quotes.setQuoteSource({}); // 清掉假数据留下的快照，后面的断言继续用真实行情
 
 console.log(`\n结果：${failures === 0 ? '全部通过' : `${failures} 项未通过`}`);

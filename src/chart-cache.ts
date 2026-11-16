@@ -9,7 +9,8 @@ type Entry = { at: number; data: unknown };
 const entries = new Map<string, Entry>();
 const flights = new Map<string, Promise<unknown>>();
 
-export type ChartKind = 'trends' | 'kline';
+// kweek 与 kline 走同一个接口，只是 period 不同；分开缓存，切换时互不覆盖
+export type ChartKind = 'trends' | 'kline' | 'kweek';
 
 export function cachedSeries<T>(secid: string, kind: ChartKind): T | undefined {
   const hit = entries.get(`${secid}:${kind}`);
@@ -22,7 +23,10 @@ export function loadSeries<T>(secid: string, kind: ChartKind): Promise<T> {
   if (fresh !== undefined) return Promise.resolve(fresh);
   const flying = flights.get(key);
   if (flying) return flying as Promise<T>;
-  const task = api<{ series: T }>('chart', { secid, kind, count: kind === 'kline' ? 160 : undefined }, true)
+  const payload = kind === 'trends'
+    ? { secid, kind }
+    : { secid, kind: 'kline', period: kind === 'kweek' ? 'week' : 'day', count: kind === 'kweek' ? 120 : 160 };
+  const task = api<{ series: T }>('chart', payload, true)
     .then((result) => {
       entries.set(key, { at: Date.now(), data: result.series });
       if (entries.size > 120) {

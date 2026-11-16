@@ -8,6 +8,7 @@
 // 没有 iconv，用 TextDecoder('gbk')：自建 Node 带 full-icu 可用；
 // 边缘运行时若不支持会退成乱码文本，因此默认源序把东财排在最前。
 import { MICRO, FX_SECID, etParts, limitPricesOf, marketOf, secidOf, splitSecid, tickOf, tradableOf } from './rules.mjs';
+import { quoteFetch } from './transport.mjs';
 
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36';
 const BATCH = 60; // 腾讯/新浪单次批量请求的代码数上限（实测 80 条会被截断，保守取 60）
@@ -40,10 +41,45 @@ const round = (v) => {
   return n === null ? null : Math.round(n);
 };
 
+// 周 K：东财与腾讯都有原生周线，新浪只有日线，所以要有「日线按周合并」这条兜底路。
+// 周的归属按 ISO 口径（周一为一周之始），一根周 K 的日期取该周最后一个交易日。
+function weekKey(day) {
+  const text = String(day ?? '').slice(0, 10);
+  const date = new Date(`${text}T00:00:00Z`);
+  if (Number.isNaN(date.getTime())) return text;
+  date.setUTCDate(date.getUTCDate() - ((date.getUTCDay() + 6) % 7));
+  return date.toISOString().slice(0, 10);
+}
+
+export function weeklyFromDaily(bars) {
+  const out = [];
+  const keys = [];
+  for (const bar of bars ?? []) {
+    const key = weekKey(bar.day);
+    const last = out[out.length - 1];
+    if (last && keys[keys.length - 1] === key) {
+      last.day = bar.day;
+      last.close = bar.close;
+      last.high = Math.max(last.high, bar.high);
+      last.low = Math.min(last.low, bar.low);
+      last.volume += bar.volume || 0;
+      continue;
+    }
+    out.push({ day: bar.day, open: bar.open, close: bar.close, high: bar.high, low: bar.low, volume: bar.volume || 0 });
+    keys.push(key);
+  }
+  return out;
+}
+
+// 合成 N 根周 K 大约要 5N 个交易日；上限压在 1000 行，别为了周线把上游拉爆
+const WEEKLY_DAILY_ROWS = (count) => Math.min(1_000, Math.max(60, Math.round(count * 5)));
+
+// 出网统一走 transport 的 quoteFetch：自建入口把它换成带代理的实现时，三个源一起受益，
+// 而行情层本身仍然不知道代理的存在（边缘运行时没有原始套接字）。
 async function fetchText(url, { ms = 5_000, gbk = false, headers = {} } = {}) {
-  const response = await fetch(url, {
+  const response = await quoteFetch(url, {
+    ms,
     headers: { 'user-agent': UA, accept: '*/*', ...headers },
-    signal: AbortSignal.timeout(ms),
   });
   if (!response.ok) throw new Error(`upstream_${response.status}`);
   const buffer = await response.arrayBuffer();
@@ -279,8 +315,10 @@ const eastmoney = {
       }).filter((p) => Number.isFinite(p.price)),
     };
   },
-  async kline(cfg, secid, count) {
-    const url = `https://${cfg.histHost}/api/qt/stock/kline/get?secid=${secid}&fields1=f1,f2,f3,f4,f5,f6&fields2=f51,f52,f53,f54,f55,f56&klt=101&fqt=1&lmt=${count}&end=20500101`;
+  async kline(cfg, secid, count, period = 'day') {
+    // klt=101 日线、102 周线；东财两个都给，不用自己合并
+    const klt = period === 'week' ? 102 : 101;
+    const url = `https://${cfg.histHost}/api/qt/stock/kline/get?secid=${secid}&fields1=f1,f2,f3,f4,f5,f6&fields2=f51,f52,f53,f54,f55,f56&klt=${klt}&fqt=1&lmt=${count}&end=20500101`;
     const body = await fetchJson(url, { ms: Math.max(cfg.timeoutMs, 5_000) });
     if (!Array.isArray(body.data?.klines)) throw new Error('kline_shape');
     // f51,f52,f53,f54,f55 = 日期,开,收,高,低
@@ -465,18 +503,29 @@ const tencent = {
       }),
     };
   },
-  async kline(cfg, secid, count) {
+  async kline(cfg, secid, count, period = 'day') {
     const us = marketOf(secid) === 'us';
     const native = us ? await qqUsFullCode(cfg, secid) : qqCode(secid);
     if (!native) throw new Error('kline_unsupported');
-    const body = await fetchJson(`https://${cfg.txKlineHost}/appstock/app/fqkline/get?param=${native},day,,,${count},qfq`, { ms: Math.max(cfg.timeoutMs, 5_000) });
-    const node = body.data?.[native] ?? {};
-    const lines = node.qfqday ?? node.day;
+    const ask = async (span, rows) => {
+      const body = await fetchJson(`https://${cfg.txKlineHost}/appstock/app/fqkline/get?param=${native},${span},,,${rows},qfq`, { ms: Math.max(cfg.timeoutMs, 5_000) });
+      const node = body.data?.[native] ?? {};
+      return node[`qfq${span}`] ?? node[span];
+    };
+    const bar = ([day, open, close, high, low, volume]) => ({
+      day, open: micro(open), close: micro(close), high: micro(high), low: micro(low), volume: Number(volume) || 0,
+    });
+    const want = period === 'week' ? 'week' : 'day';
+    let lines = await ask(want, count);
+    if (want === 'week' && (!Array.isArray(lines) || !lines.length)) {
+      // 部分标的（尤其美股）这条接口不回周线：退一步取日线自己按周合并，别把周 K 整个判死
+      const daily = await ask('day', WEEKLY_DAILY_ROWS(count));
+      if (!Array.isArray(daily) || !daily.length) throw new Error('kline_shape');
+      return weeklyFromDaily(daily.map(bar)).slice(-count);
+    }
     if (!Array.isArray(lines) || !lines.length) throw new Error('kline_shape');
     // 与东财同序：日期,开,收,高,低,量(手)。美股那条会无视 count 直接回全历史，这里自己截
-    return lines.slice(-count).map(([day, open, close, high, low, volume]) => ({
-      day, open: micro(open), close: micro(close), high: micro(high), low: micro(low), volume: Number(volume) || 0,
-    }));
+    return lines.slice(-count).map(bar);
   },
 };
 
@@ -552,18 +601,21 @@ const sina = {
     const rows = await this.byCodes(cfg, [qqCode(secid)]);
     return rows.find((row) => row.secid === secid) ?? null;
   },
-  async kline(cfg, secid, count) {
+  async kline(cfg, secid, count, period = 'day') {
     const native = qqCode(secid);
-    const text = await fetchText(`https://${cfg.sinaHistHost}/cn/api/json_v2.php/CN_MarketDataService.getKLineData?symbol=${native}&scale=240&ma=no&datalen=${count}`, {
+    // 新浪这条只有 scale=240 的日线，周线靠本地按周合并
+    const week = period === 'week';
+    const text = await fetchText(`https://${cfg.sinaHistHost}/cn/api/json_v2.php/CN_MarketDataService.getKLineData?symbol=${native}&scale=240&ma=no&datalen=${week ? WEEKLY_DAILY_ROWS(count) : count}`, {
       ms: Math.max(cfg.timeoutMs, 5_000), headers: this.headers,
     });
     const list = JSON.parse(text);
     if (!Array.isArray(list) || !list.length) throw new Error('kline_shape');
     // 新浪字段序是 open,high,low,close，与东财不同，别抄错
-    return list.map((row) => ({
+    const bars = list.map((row) => ({
       day: String(row.day).slice(0, 10), open: micro(row.open), close: micro(row.close),
       high: micro(row.high), low: micro(row.low), volume: Number(row.volume) || 0,
     }));
+    return week ? weeklyFromDaily(bars).slice(-count) : bars;
   },
 };
 

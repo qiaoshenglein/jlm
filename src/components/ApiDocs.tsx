@@ -19,7 +19,7 @@ const ENDPOINTS: { group: string; items: { method: string; path: string; note: s
       { method: 'GET', path: '/api/v1/quote?symbol=…', note: '单标的实时行情。symbol 接受 AAPL / 600519 / 105.AAPL / 1.510300' },
       { method: 'GET', path: '/api/v1/quotes?market=cn', note: '行情池快照：指数、ETF、个股、涨跌榜（美股无涨跌家数）' },
       { method: 'GET', path: '/api/v1/search?q=英伟达&market=us', note: '代码与名称检索，结果不跨市场' },
-      { method: 'GET', path: '/api/v1/chart?symbol=…&kind=trends|kline', note: '分时与日 K，count 上限 320' },
+      { method: 'GET', path: '/api/v1/chart?symbol=…&kind=trends|kline&period=day|week', note: '分时与日 K / 周 K，count 上限 320；周 K 一根的日期取该周最后一个交易日' },
       { method: 'GET', path: '/api/v1/rules', note: '两市规则与当前挂牌参数' },
       { method: 'GET', path: '/api/v1/leaderboard', note: '当日盈亏榜（合并人民币口径）' },
     ],

@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState, type WheelEvent } from 'react';
 import { api } from '../api';
-import { cachedSeries, loadSeries, prefetchChart } from '../chart-cache';
+import { cachedSeries, loadSeries, prefetchChart, type ChartKind } from '../chart-cache';
 import { CandleChart, MiniBar, PriceCell, TrendChart, type Marker } from './charts';
 import {
   currencyOfSecid, marketOfSecid, percent, priceText, tickOfSecid, tone,
@@ -148,12 +148,12 @@ export function MarketPanel({ board, selected, held, watch, watchQuotes, filter,
     return () => window.removeEventListener('keydown', onKey);
   }, [pageCount]);
 
-  // 选中项的日 K 与左右邻居的分时提前取好，点过去就是零等待
+  // 选中项的日 K / 周 K 与左右邻居的分时提前取好，点过去就是零等待
   useEffect(() => {
     if (query || !selected) return;
     const at = rows.findIndex((row) => row.secid === selected);
     if (at < 0) return;
-    prefetchChart(selected, ['kline']);
+    prefetchChart(selected, ['kline', 'kweek']);
     for (const delta of [-1, 1]) {
       const near = rows[at + delta];
       if (near) prefetchChart(near.secid);
@@ -365,10 +365,16 @@ function Slot() {
 type Trends = { name: string; preClose: number; points: { t: string; price: number; volume: number; avg: number }[] };
 type Bars = { day: string; open: number; close: number; high: number; low: number; volume: number }[];
 
+const CHART_KINDS: { key: ChartKind; label: string }[] = [
+  { key: 'trends', label: '分时' },
+  { key: 'kline', label: '日 K' },
+  { key: 'kweek', label: '周 K' },
+];
+
 export function DetailPanel({ quote, markers = null, compact = false, onToast }: {
   quote: Quote | null; markers?: Marker[] | null; compact?: boolean; onToast: (message: string) => void;
 }) {
-  const [kind, setKind] = useState<'trends' | 'kline'>('trends');
+  const [kind, setKind] = useState<ChartKind>('trends');
   const [trends, setTrends] = useState<Trends | null>(null);
   const [bars, setBars] = useState<Bars | null>(null);
   const [loading, setLoading] = useState(false);
@@ -399,7 +405,7 @@ export function DetailPanel({ quote, markers = null, compact = false, onToast }:
   if (!quote) {
     return (
       <div className="grid-lines flex h-full items-center justify-center rounded-lg border border-hairline bg-panel text-xs text-ink-dim">
-        选择标的后查看分时与日 K
+        选择标的后查看分时与 K 线
       </div>
     );
   }
@@ -450,10 +456,10 @@ export function DetailPanel({ quote, markers = null, compact = false, onToast }:
           <span className="text-sm">{percent(quote.pct)}</span>
         </div>
         <div className="ml-auto flex gap-1 rounded bg-muted/60 p-1 text-xs">
-          {(['trends', 'kline'] as const).map((value) => (
-            <button key={value} type="button" onClick={() => setKind(value)} aria-pressed={kind === value}
-              className={`rounded px-3 py-1 transition-colors duration-75 active:bg-surface-3 ${kind === value ? 'bg-raised text-primary' : 'text-muted-foreground hover:text-foreground'}`}>
-              {value === 'trends' ? '分时' : '日 K'}
+          {CHART_KINDS.map(({ key, label }) => (
+            <button key={key} type="button" onClick={() => setKind(key)} aria-pressed={kind === key}
+              className={`rounded px-2.5 py-1 transition-colors duration-75 active:bg-surface-3 ${kind === key ? 'bg-raised text-primary' : 'text-muted-foreground hover:text-foreground'}`}>
+              {label}
             </button>
           ))}
         </div>
@@ -477,7 +483,7 @@ export function DetailPanel({ quote, markers = null, compact = false, onToast }:
         )}
         {kind === 'trends'
           ? <TrendChart points={trends?.points ?? []} prevClose={quote.prevClose} quote={quote} markers={markers} />
-          : <CandleChart bars={bars ?? []} markers={markers} />}
+          : <CandleChart bars={bars ?? []} markers={markers} period={kind === 'kweek' ? 'week' : 'day'} />}
       </div>
     </div>
   );

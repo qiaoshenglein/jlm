@@ -210,6 +210,53 @@ try {
   });
   ok('server-chart-cache', chartLatency.warm < chartLatency.cold, JSON.stringify(chartLatency));
 
+  // 5c) 周 K 与 MACD：三档切换、副图真画出来了、周线确实是另一份数据
+  const chartSvg = page.locator('svg[role="img"][aria-label*="K 线"]');
+  const toggles = await page.evaluate(() => [...document.querySelectorAll('header button[aria-pressed]')].map((b) => b.textContent.trim()));
+  ok('chart-has-day-and-week-toggles', ['分时', '日 K', '周 K'].every((label) => toggles.includes(label)), JSON.stringify(toggles));
+
+  const bottomDays = () => page.evaluate(() => {
+    const svg = [...document.querySelectorAll('svg[role="img"]')].find((el) => /K 线/.test(el.getAttribute('aria-label') ?? ''));
+    if (!svg) return null;
+    const h = Number(svg.getAttribute('height'));
+    return {
+      label: svg.getAttribute('aria-label'),
+      days: [...svg.querySelectorAll('text')].filter((t) => Number(t.getAttribute('y')) === h - 3).map((t) => t.textContent),
+      macdText: [...svg.querySelectorAll('text')].some((t) => (t.textContent ?? '').includes('MACD 12/26/9')),
+      dif: svg.querySelectorAll('path[stroke="var(--info)"]').length,
+      dea: svg.querySelectorAll('path[stroke="var(--primary)"]').length,
+      candles: svg.querySelectorAll('g[opacity]').length,
+    };
+  });
+
+  await page.getByRole('button', { name: '日 K', exact: true }).click();
+  await page.waitForFunction(() => /日 K 线/.test([...document.querySelectorAll('svg[role="img"]')]
+    .map((el) => el.getAttribute('aria-label') ?? '').join('|')), null, { timeout: 20_000 }).catch(() => {});
+  await page.waitForTimeout(300);
+  const daily = await bottomDays();
+  ok('daily-kline-draws-macd-subplot',
+    Boolean(daily?.macdText) && daily.dif >= 1 && daily.dea >= 1 && /MACD DIF /.test(daily.label ?? ''),
+    JSON.stringify(daily));
+
+  const chartBox = await chartSvg.boundingBox();
+  await page.mouse.move(chartBox.x + chartBox.width * 0.5, chartBox.y + chartBox.height * 0.25);
+  await page.waitForTimeout(250);
+  const hoverMacd = await page.evaluate(() => [...document.querySelectorAll('svg[role="img"] text')]
+    .map((t) => t.textContent ?? '').filter((t) => t.includes('DIF') && t.includes('DEA') && t.includes('柱')));
+  ok('crosshair-readout-carries-macd', hoverMacd.length >= 1, JSON.stringify(hoverMacd).slice(0, 140));
+
+  await page.getByRole('button', { name: '周 K', exact: true }).click();
+  await page.waitForFunction(() => /周 K 线/.test([...document.querySelectorAll('svg[role="img"]')]
+    .map((el) => el.getAttribute('aria-label') ?? '').join('|')), null, { timeout: 25_000 }).catch(() => {});
+  await page.waitForTimeout(300);
+  const weekly = await bottomDays();
+  // 周线同样画满一屏，起点必须比日线更早（否则就是拿了日线冒充周线）
+  ok('weekly-kline-is-a-longer-span',
+    Boolean(weekly?.macdText) && /^周 K 线/.test(weekly.label ?? '') && weekly.candles >= 20
+    && (weekly.days[0] ?? '9999') < (daily.days[0] ?? '0000') && (weekly.days.at(-1) ?? '') >= (daily.days.at(-1) ?? ''),
+    `周 ${weekly?.days?.[0]}→${weekly?.days?.at(-1)}（${weekly?.candles} 根）· 日 ${daily?.days?.[0]}→${daily?.days?.at(-1)}（${daily?.candles} 根）`);
+  await page.mouse.move(chartBox.x + 4, chartBox.y + 4);
+
   await page.mouse.move(rowBox.x + 60, rowBox.y + 6);
   const beforeWheel = at((await snap()).pager);
   await page.mouse.wheel(0, 140);
@@ -246,9 +293,10 @@ try {
   await box.fill('600519');
   await page.waitForTimeout(900);
   await box.press('Enter');
-  await page.waitForTimeout(500);
+  // 上游被拒时检索要一两秒才回来，等固定时长会把「慢」误判成「选错标的」
+  await page.waitForFunction(() => (document.querySelector('h2')?.textContent ?? '').includes('贵州茅台'), null, { timeout: 15_000 }).catch(() => {});
   const picked = await page.evaluate(() => document.querySelector('h2')?.textContent ?? '');
-  ok('enter-picks-first-result', picked.includes('贵州茅台'), `head=${picked.length}`);
+  ok('enter-picks-first-result', picked.includes('贵州茅台'), `head=${picked}`);
   const clear = page.getByRole('button', { name: '清空搜索' });
   ok('clear-button-present', await clear.count() === 1);
   await clear.click();
