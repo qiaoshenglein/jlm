@@ -96,6 +96,15 @@ type QuoteCheck = {
   health: { cn: QuoteHealth; us: QuoteHealth }; advice: string[]; source: QuoteSource; checkedAt: string;
 };
 
+type UsageRow = { key: string; label: string; calls: number; ok: number; fail: number; avgMs: number };
+type UsageLayer = { layer: string; label: string; hit: number; miss: number; merged: number; rate: number };
+type UsageMinute = { at: string; calls: number; fail: number };
+type QuoteUsage = {
+  since: string; uptimeMs: number; windowMinutes: number;
+  total: { calls: number; ok: number; fail: number; probe: number };
+  byCap: UsageRow[]; byProvider: UsageRow[]; cache: UsageLayer[]; perMinute: UsageMinute[];
+};
+
 type ProxyPolicy = {
   enabled: boolean; mode: string; apiUrl: string; protocol: string; count: number;
   ttlMs: number; minPullMs: number; maxFails: number; connectMs: number; totalMs: number;
@@ -275,6 +284,8 @@ export function Admin({ onExit }: { onExit: () => void }) {
   const [proxyDraft, setProxyDraft] = useState<ProxyPolicy | null>(null);
   const [proxyCheck, setProxyCheck] = useState<ProxyCheckResult | null>(null);
   const [proxyBusy, setProxyBusy] = useState('');
+  const [usage, setUsage] = useState<QuoteUsage | null>(null);
+  const [usageBusy, setUsageBusy] = useState(false);
   const [scopes, setScopes] = useState({ data: true, config: true, audit: true, sessions: false });
   const [doc, setDoc] = useState<BackupDocument | null>(null);
   const [picked, setPicked] = useState<{ name: string; bytes: number; document: BackupDocument } | null>(null);
@@ -293,6 +304,18 @@ export function Admin({ onExit }: { onExit: () => void }) {
     const at = window.setTimeout(() => setPending(''), 5_000);
     return () => window.clearTimeout(at);
   }, [pending]);
+
+  // 用量卡自己每 2 秒拉一次：「我点这一下有没有打上游」要的是马上看到数字动，而不是等切页
+  useEffect(() => {
+    if (tab !== 'quote') return undefined;
+    let live = true;
+    const pull = () => api<QuoteUsage>('admin_quote_usage')
+      .then((result) => { if (live) setUsage(result); })
+      .catch(() => undefined);
+    void pull();
+    const poll = window.setInterval(pull, 2_000);
+    return () => { live = false; window.clearInterval(poll); };
+  }, [tab]);
 
   const load = useCallback(async (which: Tab, search = '') => {
     setLoading(true);
@@ -324,6 +347,19 @@ export function Admin({ onExit }: { onExit: () => void }) {
       setLoading(false);
     }
   }, []);
+
+  // 归零只是清进程内的计数，不动任何数据；先归零再立刻回读，页面显示的就是归零后的那一格
+  const resetUsageCount = async () => {
+    setUsageBusy(true);
+    try {
+      setUsage(await api<QuoteUsage>('admin_quote_usage_reset'));
+      toast.success('上游用量已归零');
+    } catch (error) {
+      toast.error(error instanceof ApiError ? error.message : '归零未成功');
+    } finally {
+      setUsageBusy(false);
+    }
+  };
 
   const loadFlow = useCallback(async (offset = 0) => {
     setLoading(true);
@@ -769,6 +805,8 @@ export function Admin({ onExit }: { onExit: () => void }) {
               <HealthCard item={quote.health.cn} fx={quote.fx} />
               <HealthCard item={quote.health.us} fx={quote.fx} />
             </div>
+
+            {usage && <UsageCard usage={usage} busy={usageBusy} onReset={() => void resetUsageCount()} />}
 
             <section className="rounded border border-hairline bg-raised p-3">
               <div className="flex flex-wrap items-center gap-2">
@@ -1410,7 +1448,75 @@ function HealthCard({ item, fx }: { item: QuoteHealth; fx: number }) {
   );
 }
 
-function Badge({ text, kind }: { text: string; kind: 'up' | 'down' | 'primary' | 'muted' }) {  const map = {
+/** 上游用量：把「真出网几次」和「缓存挡下几次」放在同一张卡里，直接回答「我点这一下有没有打上游」 */
+function UsageCard({ usage, busy, onReset }: { usage: QuoteUsage; busy: boolean; onReset: () => void }) {
+  const peak = Math.max(...usage.perMinute.map((row) => row.calls), 0);
+  const blocked = usage.cache.reduce((sum, row) => sum + row.hit, 0);
+  const passed = usage.cache.reduce((sum, row) => sum + row.miss, 0);
+  return (
+    <section className="rounded border border-hairline bg-raised p-3">
+      <div className="flex flex-wrap items-center gap-2">
+        <span className="text-[0.8125rem] font-medium">上游用量</span>
+        <span className="chip num border-hairline text-ink-dim">出网 {usage.total.calls} 次</span>
+        {usage.total.fail > 0 && <span className="chip num border-up/45 bg-up/12 text-up">失败 {usage.total.fail}</span>}
+        {usage.total.probe > 0 && <span className="chip num border-hairline text-ink-dim">其中主动检测 {usage.total.probe}</span>}
+        <span className="chip num border-hairline text-ink-dim">缓存挡下 {blocked} · 放行 {passed}</span>
+        <span className="num ml-auto text-[0.6875rem] text-ink-dim">自 {clockTime(usage.since)} 起 · 进程内计数，重启归零</span>
+        <MiniButton armedKey="" pending="" text={busy ? '归零中…' : '归零计数'} disabled={busy} onFire={onReset} />
+      </div>
+
+      <div role="img" aria-label={`最近 ${usage.windowMinutes} 分钟每分钟出网次数，峰值 ${peak} 次`}
+        className="mt-3 flex h-10 items-end gap-px">
+        {usage.perMinute.map((row) => (
+          <span key={row.at} title={`${clockTime(row.at)} · ${row.calls} 次${row.fail ? ` · 失败 ${row.fail}` : ''}`}
+            className="flex h-full w-1.5 flex-col justify-end rounded-sm bg-primary/12">
+            <span className={`w-full rounded-sm ${row.fail ? 'bg-up/70' : 'bg-primary/60'}`}
+              style={{ height: row.calls ? `${Math.max(16, Math.round((row.calls / peak) * 100))}%` : '0%' }} />
+          </span>
+        ))}
+      </div>
+      <p className="num text-[0.6875rem] text-ink-dim">最近 {usage.windowMinutes} 分钟 · 每分钟一格 · 峰值 {peak} 次</p>
+
+      <div className="mt-2 grid gap-3 sm:grid-cols-3">
+        <UsageTable title="按能力" head={['能力', '次数', '均耗时']}
+          rows={usage.byCap.map((row) => [row.label, `${row.calls}${row.fail ? `（败 ${row.fail}）` : ''}`, `${row.avgMs}ms`])} />
+        <UsageTable title="按源" head={['源', '次数', '均耗时']}
+          rows={usage.byProvider.map((row) => [row.label, `${row.calls}${row.fail ? `（败 ${row.fail}）` : ''}`, `${row.avgMs}ms`])} />
+        <UsageTable title="缓存层" head={['层', '挡下', '命中率']}
+          rows={usage.cache.map((row) => [row.label, `${row.hit}${row.merged ? `（合并 ${row.merged}）` : ''}`, `${row.rate}%`])} />
+      </div>
+    </section>
+  );
+}
+
+function UsageTable({ title, head, rows }: { title: string; head: string[]; rows: string[][] }) {
+  return (
+    <div className="min-w-0">
+      <p className="text-[0.75rem] text-ink-dim">{title}</p>
+      {rows.length === 0 ? (
+        <p className="num mt-1 text-[0.75rem] text-ink-dim">还没有出网记录</p>
+      ) : (
+        <table className="mt-1 w-full border-collapse text-[0.75rem]">
+          <thead>
+            <tr>{head.map((item) => <th key={item} className="border-b border-hairline/70 pb-0.5 text-left font-normal text-ink-dim">{item}</th>)}</tr>
+          </thead>
+          <tbody>
+            {rows.map((row) => (
+              <tr key={row[0]}>
+                <td className="max-w-[11rem] truncate py-0.5">{row[0]}</td>
+                <td className="num py-0.5 text-right">{row[1]}</td>
+                <td className="num py-0.5 text-right text-ink-dim">{row[2]}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+    </div>
+  );
+}
+
+function Badge({ text, kind }: { text: string; kind: 'up' | 'down' | 'primary' | 'muted' }) {
+  const map = {
     up: 'border-up/40 bg-up/12 text-up', down: 'border-down/40 bg-down/12 text-down',
     primary: 'border-primary/45 bg-primary/12 text-primary', muted: 'border-hairline bg-muted text-muted-foreground',
   } as const;

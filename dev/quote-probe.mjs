@@ -406,6 +406,58 @@ ok('chart 接口按 period 分档返回，日/周互不覆盖',
   && chartTrends.json.period === 'day' && Array.isArray(chartTrends.json.series?.points),
   `周 ${chartWeek.json.series?.length} 根（首根 ${chartWeek.json.series?.[0]?.day}）· 日 ${chartDay.json.series?.length} 根 · 分时 ${chartTrends.json.series?.points?.length} 点`);
 
+// ---- 11c. 上游用量计数：同一根 K 线点两次，只算一次出网 ----
+// 这段用假上游自己收到的请求数当对照——计数说几次，实际就得是几次，否则卡片在说谎
+tick(65_000);
+resetCalls();
+const worker = await call('register', { username: 'qq_worker', password: 'probe12345', display: '看盘的人' });
+const afterReset = await call('admin_quote_usage_reset', {}, bt);
+ok('重置用量计数后归零', afterReset.status === 200 && afterReset.json.total?.calls === 0
+  && (afterReset.json.byCap?.length ?? 1) === 0 && (afterReset.json.cache?.length ?? 1) === 0,
+  `调用 ${afterReset.json.total?.calls} · 能力 ${(afterReset.json.byCap ?? []).length} 项`);
+const capOf = (usage, key) => usage.byCap.find((row) => row.key === key) ?? { calls: 0, ok: 0, fail: 0 };
+const layerOf = (usage, key) => usage.cache.find((row) => row.layer === key) ?? { hit: 0, miss: 0, merged: 0, rate: 0 };
+await call('chart', { secid: '1.600036', kind: 'kline', count: 50 });
+await call('chart', { secid: '1.600036', kind: 'kline', count: 50 });
+await call('chart', { secid: '1.600036', kind: 'kline', period: 'week', count: 50 });
+const usageK = (await call('admin_quote_usage', {}, bt)).json;
+ok('同键日 K 点两次只出网一次，换周 K 是新键再出网一次',
+  capOf(usageK, 'kline').calls === 2 && layerOf(usageK, 'kline').miss === 2
+  && layerOf(usageK, 'kline').hit === 1 && layerOf(usageK, 'kline').rate === 33,
+  `出网 ${capOf(usageK, 'kline').calls} 次 · 挡下 ${layerOf(usageK, 'kline').hit} 次 · 命中率 ${layerOf(usageK, 'kline').rate}%`);
+ok('计数次数与假上游收到的请求数一致', calls.length === usageK.total.calls,
+  `上游收到 ${calls.length} 条 · 计数 ${usageK.total.calls} 次`);
+ok('总量与按能力、按源的分布自洽',
+  usageK.total.calls === usageK.byCap.reduce((sum, row) => sum + row.calls, 0)
+  && usageK.total.calls === usageK.byProvider.reduce((sum, row) => sum + row.calls, 0)
+  && usageK.total.ok + usageK.total.fail === usageK.total.calls,
+  `总 ${usageK.total?.calls} · 能力合计 ${usageK.byCap?.reduce((s, r) => s + r.calls, 0)} · 源合计 ${usageK.byProvider?.reduce((s, r) => s + r.calls, 0)}`);
+
+resetCalls();
+await call('board', {}, bt);
+const poolFirst = (await call('admin_quote_usage', {}, bt)).json;
+const boardCalls = poolFirst.total.calls;
+resetCalls();
+await call('board', {}, bt);
+const poolTwice = (await call('admin_quote_usage', {}, bt)).json;
+ok('TTL 内的第二次同步不再出网，只算一次快照命中',
+  poolTwice.total.calls === boardCalls && layerOf(poolTwice, 'pool_cn').hit >= 1
+  && layerOf(poolTwice, 'pool_cn').miss >= 1 && calls.length === 0,
+  `挡下 ${layerOf(poolTwice, 'pool_cn').hit} 次 · 刷新 ${layerOf(poolTwice, 'pool_cn').miss} 次 · 本窗口出网 ${calls.length} 次`);
+ok('用量按分钟给桶，窗口固定 30 格', usageK.perMinute?.length === 30 && usageK.windowMinutes === 30
+  && usageK.perMinute.at(-1).calls >= 1, `桶 ${usageK.perMinute?.length} · 当前分钟 ${usageK.perMinute?.at(-1)?.calls} 次`);
+const noToken = await call('admin_quote_usage', {});
+const notAdmin = await call('admin_quote_usage', {}, worker.json.token);
+ok('读用量要管理员凭证', noToken.json.code === 'login_required' && notAdmin.json.code === 'not_admin',
+  `无凭证 ${noToken.json.code} · 普通用户 ${notAdmin.json.code}`);
+const getReset = await handle({
+  request: new Request('http://x/functions/v1/app?action=admin_quote_usage_reset', {
+    method: 'GET', headers: { authorization: `Bearer ${bt}` },
+  }),
+  supabase,
+});
+ok('重置计数只认 POST', getReset.status === 405, `GET 回 ${getReset.status}`);
+
 // ---- 12. 配置校验：源序、冷却、新域名 ----
 const badOrder = await call('admin_settings', { patch: { quote_source: { sourceOrder: ['eastmoney', 'baidu'] } }, confirm: true }, bt);
 ok('未知源名被逐项拒绝', badOrder.status === 400 && /sourceOrder/.test((badOrder.json.rejected ?? []).join('；')), (badOrder.json.rejected ?? []).join('；'));

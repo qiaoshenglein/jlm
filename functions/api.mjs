@@ -73,12 +73,14 @@ const bad = (code, status = 400, extra = null) => {
 const READ_ACTIONS = new Set(['board', 'sync', 'me', 'chart', 'leader', 'rules', 'lookup', 'search',
   'account', 'positions', 'orders', 'trades', 'markets', 'key_list',
   'admin_overview', 'admin_users', 'admin_user', 'admin_orders', 'admin_audit', 'admin_settings',
-  'admin_quote_status', 'admin_quote_check', 'admin_proxy_status']);
+  'admin_quote_status', 'admin_quote_check', 'admin_quote_usage', 'admin_proxy_status']);
 const WRITE_ACTIONS = new Set(['register', 'login', 'logout', 'order', 'cancel', 'preview', 'watch_add', 'watch_remove', 'watch_sort',
   'key_create', 'key_revoke',
   'admin_freeze', 'admin_unfreeze', 'admin_unlock', 'admin_revoke_sessions', 'admin_role', 'admin_grant_cash',
   // 拉代理与检测都会真实出网（还会改进程内的代理池），按写操作对待：GET 一律拒绝
   'admin_proxy_pull', 'admin_proxy_check',
+  // 归零用量计数改的是进程状态，按写操作对待：GET 一律拒绝
+  'admin_quote_usage_reset',
   // 备份三个动作都要写库（导出也写审计），因此按写操作对待：GET 一律拒绝
   'admin_backup_export', 'admin_backup_preview', 'admin_backup_apply']);
 

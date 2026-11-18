@@ -89,6 +89,24 @@ try {
   await page.getByRole('button', { name: '分时', exact: true }).click();
   await page.waitForTimeout(900);
 
+  // 专注看图：三块面板全收，图表横向铺满、纵向吃掉账本那一截；边缘留竖排把手可以召回
+  await page.getByRole('button', { name: '日 K', exact: true }).click();
+  await page.waitForTimeout(2_000);
+  await page.getByRole('button', { name: /专注看图/ }).click();
+  await page.waitForTimeout(900);
+  await page.screenshot({ path: join(OUT, 'desk-focus.png') });
+  const focusBox = await page.locator('svg[role="img"][aria-label*="K 线"]').boundingBox();
+  await page.mouse.move(focusBox.x + focusBox.width * 0.62, focusBox.y + focusBox.height * 0.3);
+  await page.waitForTimeout(400);
+  await page.screenshot({ path: join(OUT, 'desk-focus-crosshair.png') });
+  await page.getByRole('button', { name: '展开下单' }).click();
+  await page.waitForTimeout(700);
+  await page.screenshot({ path: join(OUT, 'desk-focus-with-ticket.png') });
+  // 这时已经不是「三块全收」，退出专注按钮变回了专注看图，只能逐个把剩下两块点回来
+  await page.locator('[aria-label="面板显隐"] button', { hasText: '行情列表' }).click();
+  await page.locator('[aria-label="面板显隐"] button', { hasText: '账本' }).click();
+  await page.waitForTimeout(700);
+
   await page.getByRole('button', { name: '疏' }).click();
   await page.waitForTimeout(600);
   await page.screenshot({ path: join(OUT, 'desk-roomy.png') });

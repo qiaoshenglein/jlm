@@ -19,6 +19,23 @@ import type { Marker } from './components/charts';const DENSITY = ['compact', 's
 const SYNC_MS = 3_000;
 const PUBLIC_MS = 10_000;
 const START_CASH = 1_000_000_000_000; // 100 万虚拟本金（微元）
+// 看盘时最常做的事就是把三块侧栏全收起，只留图表；显隐状态和行距密度一样按人记住
+const PANELS_KEY = 'mirror.desk.panels';
+const PANELS_ALL = { list: false, ticket: false, book: false } as const;
+const PANELS_DEFAULT = { list: true, ticket: true, book: true } as const;
+type Panels = { list: boolean; ticket: boolean; book: boolean };
+const PANEL_LABEL: Record<keyof Panels, string> = { list: '行情列表', ticket: '下单', book: '账本' };
+const PANEL_KEY_HINT: Record<keyof Panels, string> = { list: '[', ticket: ']', book: '\\' };
+function readPanels(): Panels {
+  try {
+    const raw = localStorage.getItem(PANELS_KEY);
+    if (!raw) return { ...PANELS_DEFAULT };
+    const saved = JSON.parse(raw) as Partial<Panels>;
+    return {
+      list: saved.list !== false, ticket: saved.ticket !== false, book: saved.book !== false,
+    };
+  } catch { return { ...PANELS_DEFAULT }; }
+}
 type User = { id: string; username: string; display: string; role?: 'user' | 'admin'; status?: 'active' | 'frozen' };export default function App() {
   const [user, setUser] = useState<User | null>(null);
   const [account, setAccount] = useState<Account | null>(null);
@@ -59,6 +76,14 @@ type User = { id: string; username: string; display: string; role?: 'user' | 'ad
   });
   const [resolving, setResolving] = useState(false);
   const [signingOut, setSigningOut] = useState(false);
+  const [panels, setPanels] = useState<Panels>(readPanels);
+  const focusMode = !panels.list && !panels.ticket && !panels.book;
+  const togglePanel = useCallback((key: keyof Panels) => {
+    setPanels((prev) => ({ ...prev, [key]: !prev[key] }));
+  }, []);
+  const toggleFocus = useCallback(() => {
+    setPanels((prev) => (prev.list || prev.ticket || prev.book ? { ...PANELS_ALL } : { ...PANELS_DEFAULT }));
+  }, []);
   const [view, setView] = useState<'quote' | 'trade' | 'account'>('quote');
   const [route, setRoute] = useState(() => (typeof window === 'undefined' ? '' : window.location.hash));
   useEffect(() => {
@@ -165,6 +190,9 @@ type User = { id: string; username: string; display: string; role?: 'user' | 'ad
     document.documentElement.dataset.density = density;
     try { localStorage.setItem('mirror.desk.density', density); } catch { /* 隐私模式下仅本次生效 */ }
   }, [density]);
+  useEffect(() => {
+    try { localStorage.setItem(PANELS_KEY, JSON.stringify(panels)); } catch { /* 隐私模式下仅本次生效 */ }
+  }, [panels]);
 
   // 未登录时也要有真实指数带：注册页的背景就是行情
   useEffect(() => {
@@ -225,6 +253,7 @@ type User = { id: string; username: string; display: string; role?: 'user' | 'ad
         setShowRules(false);
         setShowApi(false);
         if (typing) target?.blur();
+        else if (focusMode && !showRules && !showApi) toggleFocus();
         else setSearch('');
         return;
       }
@@ -258,11 +287,22 @@ type User = { id: string; username: string; display: string; role?: 'user' | 'ad
       if (event.key === 'a' || event.key === 'A') {
         event.preventDefault();
         setShowApi(true);
+        return;
+      }
+      // [ ] \ 分别收起/展开左列表、右下单、下账本；F 一键专注（三块全收），Esc 退出专注
+      if (event.key === '[' || event.key === ']' || event.key === '\\') {
+        event.preventDefault();
+        togglePanel(event.key === '[' ? 'list' : event.key === ']' ? 'ticket' : 'book');
+        return;
+      }
+      if (event.key === 'f' || event.key === 'F') {
+        event.preventDefault();
+        toggleFocus();
       }
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [market, mobile, selected, showApi, showRules, switchMarket, visibleRows, user]);
+  }, [focusMode, market, mobile, selected, showApi, showRules, switchMarket, toggleFocus, togglePanel, visibleRows, user]);
 
   async function submitAuth(action: 'login' | 'register', payload: Record<string, string>) {
     const result = await api<{
@@ -432,9 +472,15 @@ type User = { id: string; username: string; display: string; role?: 'user' | 'ad
   );
   const onAdmin = route.startsWith('#/admin') && user.role === 'admin';
   const frozen = user.status === 'frozen';
+  // 收起哪一栏就从网格里去掉哪一列：留着 0px 列会白占一份 gap，图表反而宽不出来
+  const desktopColumns = [
+    panels.list ? 'minmax(230px,18rem)' : null,
+    'minmax(0,1fr)',
+    panels.ticket ? 'minmax(300px,21rem)' : null,
+  ].filter(Boolean).join(' ');
   return (
-    <div className={`flex flex-col ${mobile || onAdmin ? 'h-dvh overflow-hidden' : 'min-h-dvh'}`}>
-      <header className={`z-20 border-b border-hairline bg-background/92 backdrop-blur ${mobile ? 'shrink-0' : 'sticky top-0'}`}>
+    <div className="flex h-dvh flex-col overflow-hidden">
+      <header className="z-20 shrink-0 border-b border-hairline bg-background/92 backdrop-blur">
         <div className={`flex flex-wrap items-center gap-y-1 ${mobile ? 'gap-x-2 px-3 py-1.5' : 'gap-x-4 px-4 py-2'}`}>
           <div className="flex items-baseline gap-2 border-l-2 border-primary pl-2">
             <span className={`font-semibold tracking-[0.2em] ${mobile ? 'text-[1.0625rem]' : 'text-[1.1875rem]'}`}>镜盘</span>
@@ -519,13 +565,16 @@ type User = { id: string; username: string; display: string; role?: 'user' | 'ad
           {view === 'account' && <div className="view-in h-full">{book}</div>}
         </main>
       ) : (
-        <main className="grid flex-1 gap-3 p-3 lg:h-[calc(100dvh-108px)] lg:min-h-0 lg:flex-none lg:grid-rows-[minmax(0,1fr)] lg:grid-cols-[minmax(230px,18rem)_minmax(0,1fr)_minmax(300px,21rem)] lg:overflow-hidden">
-          {marketPanel}
-          <div className="scrollbar-thin flex min-h-0 flex-col gap-3 lg:overflow-y-auto">
-            <div className="min-h-[320px] flex-[6]">{detail}</div>
-            <div className="min-h-[260px] flex-[5]">{book}</div>
+        <main className="relative grid min-h-0 flex-1 grid-rows-[minmax(0,1fr)] gap-3 overflow-hidden p-3"
+          style={{ gridTemplateColumns: desktopColumns }}>
+          {panels.list && marketPanel}
+          <div className="scrollbar-thin flex min-h-0 flex-col gap-3 overflow-y-auto">
+            <div className={panels.book ? 'min-h-[320px] flex-[6]' : 'min-h-0 flex-1'}>{detail}</div>
+            {panels.book && <div className="min-h-[260px] flex-[5]">{book}</div>}
           </div>
-          {ticket}
+          {panels.ticket && ticket}
+          {!panels.list && <EdgeTab side="left" label={PANEL_LABEL.list} onClick={() => togglePanel('list')} />}
+          {!panels.ticket && <EdgeTab side="right" label={PANEL_LABEL.ticket} onClick={() => togglePanel('ticket')} />}
         </main>
       )}      {mobile ? (
         <nav aria-label="页面切换" className="nav-safe grid shrink-0 grid-cols-3 border-t border-hairline bg-panel text-[0.75rem]">
@@ -552,12 +601,15 @@ type User = { id: string; username: string; display: string; role?: 'user' | 'ad
             <kbd className="ml-2 rounded border border-hairline px-1">M</kbd> 切市场
             <kbd className="ml-2 rounded border border-hairline px-1">A</kbd> API
             <kbd className="ml-2 rounded border border-hairline px-1">Enter</kbd> 下单
+            <kbd className="ml-2 rounded border border-hairline px-1">[ ] \</kbd> 收面板
+            <kbd className="ml-2 rounded border border-hairline px-1">F</kbd> 专注
           </span>
           行情源：东方财富公开接口 · 每 {SYNC_MS / 1000} 秒撮合一轮 · 市价单以最新价全额成交 ·
           {market === 'us'
             ? ' 美股 T+0、1 股起、无每日涨跌停，两融与担保比例按 Reg T 口径'
             : ' 股票 T+1、100 股一手，涨跌停与两融担保比例按真实规则校验'} ·
           {fx > 0 ? ` · 美元折人民币 ${(fx / Y).toFixed(4)}` : ''} · 虚拟资金，不构成投资建议
+          <PanelToggles panels={panels} focusMode={focusMode} onToggle={togglePanel} onFocus={toggleFocus} />
         </footer>
       )}      {showRules && <Rules extra={reasons} market={market} onClose={() => setShowRules(false)} />}
       {showApi && <ApiDocs onClose={() => setShowApi(false)} />}
@@ -574,7 +626,46 @@ function useMedia(query: string) {
     return () => mq.removeEventListener('change', sync);
   }, [query]);
   return matches;
-}/** 市场开关即双市时段状态：中美时段互补，两个 chip 同时说清「哪边在交易、我现在看哪边」 */
+}/** 收起来的栏要在原地留一个把手：竖排小标签贴着边，一次点击就能把那一栏叫回来 */
+function EdgeTab({ side, label, onClick }: { side: 'left' | 'right'; label: string; onClick: () => void }) {
+  return (
+    <button type="button" onClick={onClick} aria-label={`展开${label}`} title={`展开${label}`}
+      className={`absolute top-1/2 z-10 flex -translate-y-1/2 items-center rounded border border-hairline bg-panel/95 px-0.5 py-3 text-ink-dim shadow-sm transition hover:border-primary/50 hover:text-primary ${side === 'left' ? 'left-0.5' : 'right-0.5'}`}>
+      <span className="text-[0.6875rem] tracking-[0.15em] [writing-mode:vertical-rl]">{label}</span>
+    </button>
+  );
+}
+
+/** 面板显隐放在页脚常驻：栏收起后它自己的开关也跟着不见了，控制器必须待在不会被收起的地方 */
+function PanelToggles({ panels, focusMode, onToggle, onFocus }: {
+  panels: Panels;
+  focusMode: boolean;
+  onToggle: (key: keyof Panels) => void;
+  onFocus: () => void;
+}) {
+  return (
+    <span role="group" aria-label="面板显隐" className="num ml-auto flex shrink-0 flex-wrap items-center gap-1">
+      {(Object.keys(PANEL_LABEL) as (keyof Panels)[]).map((key) => (
+        <button key={key} type="button" onClick={() => onToggle(key)} aria-pressed={panels[key]}
+          title={`${panels[key] ? '收起' : '展开'}${PANEL_LABEL[key]}（快捷键 ${PANEL_KEY_HINT[key]}）`}
+          className={`flex items-center gap-1 rounded border px-1.5 py-0.5 transition ${panels[key]
+            ? 'border-hairline text-foreground' : 'border-dashed border-hairline text-ink-dim hover:text-foreground'}`}>
+          <kbd className="rounded border border-hairline px-1 text-[0.625rem]">{PANEL_KEY_HINT[key]}</kbd>
+          {PANEL_LABEL[key]}
+        </button>
+      ))}
+      <button type="button" onClick={onFocus} aria-pressed={focusMode}
+        title={focusMode ? '恢复三块面板（Esc）' : '只看图表：收起行情列表、下单与账本（F）'}
+        className={`flex items-center gap-1 rounded border px-1.5 py-0.5 transition ${focusMode
+          ? 'border-primary bg-primary/15 text-primary' : 'border-primary/45 text-primary hover:bg-primary/12'}`}>
+        <kbd className="rounded border border-hairline px-1 text-[0.625rem]">F</kbd>
+        {focusMode ? '退出专注' : '专注看图'}
+      </button>
+    </span>
+  );
+}
+
+/** 市场开关即双市时段状态：中美时段互补，两个 chip 同时说清「哪边在交易、我现在看哪边」 */
 const PHASE_SHORT: Record<string, string> = {
   open: '盘中', auction: '竞价', lunch: '午休', closed: '收盘', pre: '盘前', after: '盘后',
 };

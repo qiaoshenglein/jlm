@@ -5,6 +5,7 @@ import { MICRO, bjParts, etParts, marketOf, splitSecid } from './rules.mjs';
 import {
   INDEX_ETFS, KEY_INDEXES, PROVIDER_ORDER_DEFAULT, QUOTE_PROVIDERS, US_INDEXES,
 } from './quote-sources.mjs';
+import { noteCache, noteCall } from './usage.mjs';
 
 // 指数与指数 ETF 名单定义在适配器层（三家都要用它点名取数），这里原样导出给接口层与前端
 export { INDEX_ETFS, KEY_INDEXES, US_INDEXES };
@@ -209,13 +210,16 @@ async function withChain(cap, args, nowMs) {
     try {
       const value = await provider[cap](SOURCE, ...args);
       if (isEmptyResult(cap, value)) {
+        noteCall({ cap, provider: key, ok: false, ms: Date.now() - started });
         markFail(key, '返回为空', nowMs);
         failures.push({ key, label: provider.label, error: '返回为空' });
         continue;
       }
+      noteCall({ cap, provider: key, ok: true, ms: Date.now() - started });
       markOk(key, Date.now() - started, nowMs);
       return { value, provider: key, label: provider.label, fellBack: key !== SOURCE.sourceOrder[0], tried: failures, skipped };
     } catch (error) {
+      noteCall({ cap, provider: key, ok: false, ms: Date.now() - started });
       const reason = String(error?.cause?.code ?? error?.message ?? error).slice(0, 60);
       markFail(key, reason, nowMs);
       failures.push({ key, label: provider.label, error: reason });
@@ -367,7 +371,11 @@ async function fetchUsSnapshot(nowMs) {
 
 export async function getQuotes(force = false, now = new Date()) {
   const parts = bjParts(now);
-  if (!force && snapshot.data && now.getTime() - snapshot.at < SOURCE.cnTtlMs && snapshot.day === parts.day) return snapshot.data;
+  if (!force && snapshot.data && now.getTime() - snapshot.at < SOURCE.cnTtlMs && snapshot.day === parts.day) {
+    noteCache('pool_cn', 'hit');
+    return snapshot.data;
+  }
+  noteCache('pool_cn', 'miss');
   try {
     const built = await fetchSnapshot(now.getTime());
     lastError = null;
@@ -383,7 +391,11 @@ export async function getQuotes(force = false, now = new Date()) {
 
 export async function getUsQuotes(force = false, now = new Date()) {
   const day = etParts(now).day;
-  if (!force && usSnapshot.data && now.getTime() - usSnapshot.at < SOURCE.usTtlMs && usSnapshot.day === day) return usSnapshot.data;
+  if (!force && usSnapshot.data && now.getTime() - usSnapshot.at < SOURCE.usTtlMs && usSnapshot.day === day) {
+    noteCache('pool_us', 'hit');
+    return usSnapshot.data;
+  }
+  noteCache('pool_us', 'miss');
   try {
     const built = await fetchUsSnapshot(now.getTime());
     usLastError = null;
@@ -418,7 +430,11 @@ export const quoteStatusFor = (market) => quoteStatus(market === 'us' ? 'us' : '
 // 取不到就用上一个可用值，离线兜底给一个常量，避免整条同步因为汇率失败而停摆。
 export async function getFx(now = new Date()) {
   const at = now.getTime();
-  if (at - fxCache.at < Math.min(SOURCE.fxTtlMs, 60_000)) return fxCache.rate;
+  if (at - fxCache.at < Math.min(SOURCE.fxTtlMs, 60_000)) {
+    noteCache('fx', 'hit');
+    return fxCache.rate;
+  }
+  noteCache('fx', 'miss');
   try {
     const out = await withChain('fx', [], at);
     const rate = out.value?.rate ?? null;
@@ -470,7 +486,7 @@ export function quoteHealth(market = 'cn', now = new Date()) {
 }
 
 // ---- 后台「行情源检测」：逐源逐能力实测，打的就是线上用的那条代码路径 ----
-const CAP_LABELS = {
+export const CAP_LABELS = {
   cnStocks: '沪深个股池', cnIndexes: '沪深指数', cnEtfs: '指数 ETF 补价', usStocks: '美股池', usIndexes: '美股指数',
   one: '单标的快照', fx: '汇率', trends: '当日分时', kline: '日 K / 周 K', suggest: '代码检索',
 };
@@ -530,12 +546,15 @@ export async function probeQuoteSource(key, now = new Date()) {
     const shape = probeSample(meta.cap, value);
     // 空返回按不可用算：链的降级规则也是这么判的，两边口径必须一致，否则检测页会说谎
     if (isEmptyResult(meta.cap, value)) {
+      noteCall({ cap: meta.cap, provider: meta.provider, ok: false, ms: Date.now() - started, probe: true });
       markFail(meta.provider, '返回为空', now.getTime());
       return { ...meta, host: provider.hosts[0], ok: false, ms: Date.now() - started, rows: 0, error: '返回为空' };
     }
+    noteCall({ cap: meta.cap, provider: meta.provider, ok: true, ms: Date.now() - started, probe: true });
     markOk(meta.provider, Date.now() - started, now.getTime());
     return { ...meta, host: provider.hosts[0], ok: true, ms: Date.now() - started, rows: shape.rows, sample: shape.sample, ts: shape.ts };
   } catch (error) {
+    noteCall({ cap: meta.cap, provider: meta.provider, ok: false, ms: Date.now() - started, probe: true });
     const reason = String(error?.cause?.code ?? error?.message ?? error).slice(0, 60);
     markFail(meta.provider, reason, now.getTime());
     return { ...meta, host: provider.hosts[0], ok: false, ms: Date.now() - started, error: reason };
@@ -551,7 +570,11 @@ export async function ensureQuote(secid, quotes, now = new Date()) {
   if (!us && !/^[012]\.\d{6}$/.test(secid)) return null;
   rememberDemand([secid]);
   const hit = extraCache.get(secid);
-  if (hit && now.getTime() - hit.at < (marketOf(secid) === 'us' ? SOURCE.usTtlMs : SOURCE.cnTtlMs)) return hit.quote;
+  if (hit && now.getTime() - hit.at < (marketOf(secid) === 'us' ? SOURCE.usTtlMs : SOURCE.cnTtlMs)) {
+    noteCache('extra', 'hit');
+    return hit.quote;
+  }
+  noteCache('extra', 'miss');
   try {
     const out = await withChain('one', [secid], now.getTime());
     if (out.value) extraCache.set(secid, { at: now.getTime(), quote: out.value });
@@ -565,11 +588,18 @@ export async function ensureQuote(secid, quotes, now = new Date()) {
 // 前端会预取悬停与相邻标的，没有这一层就会把上游打爆、把点击拖慢
 const NEGATIVE_TTL = 5_000;
 
-function cachedChart(key, ttl, loader) {
+function cachedChart(layer, key, ttl, loader) {
   const hit = charts.get(key);
-  if (hit && Date.now() - hit.at < (hit.data ? ttl : NEGATIVE_TTL)) return Promise.resolve(hit.data);
+  if (hit && Date.now() - hit.at < (hit.data ? ttl : NEGATIVE_TTL)) {
+    noteCache(layer, 'hit');
+    return Promise.resolve(hit.data);
+  }
   const flying = chartFlights.get(key);
-  if (flying) return flying;
+  if (flying) {
+    noteCache(layer, 'merged');
+    return flying;
+  }
+  noteCache(layer, 'miss');
   const task = (async () => {
     try {
       const data = await loader();
@@ -587,12 +617,12 @@ function cachedChart(key, ttl, loader) {
 }
 
 export function trendsOf(secid, now = new Date()) {
-  return cachedChart(`trends:${secid}`, SOURCE.trendsTtlMs, async () => (await withChain('trends', [secid], now.getTime())).value);
+  return cachedChart('trends', `trends:${secid}`, SOURCE.trendsTtlMs, async () => (await withChain('trends', [secid], now.getTime())).value);
 }
 
 export function klineOf(secid, count = 120, period = 'day', now = new Date()) {
   const span = period === 'week' ? 'week' : 'day';
-  return cachedChart(`kline:${secid}:${span}:${count}`, SOURCE.klineTtlMs,
+  return cachedChart('kline', `kline:${secid}:${span}:${count}`, SOURCE.klineTtlMs,
     async () => (await withChain('kline', [secid, count, span], now.getTime())).value);
 }
 

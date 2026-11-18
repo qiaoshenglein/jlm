@@ -158,6 +158,34 @@ try {
     `审计行数=${await page.locator('tbody tr').count()}`);
   ok('audit-hides-secrets', !auditText.includes('pass_hash') && !auditText.includes(tokens.boss.slice(0, 12)));
 
+  // 行情源页的上游用量卡：数字要看得见，归零要立刻降下来
+  await page.getByRole('tab', { name: '行情源' }).click();
+  await page.waitForFunction(() => document.body.innerText.includes('上游用量'), null, { timeout: 8_000 });
+  const usageOf = () => page.evaluate(() => {
+    const card = [...document.querySelectorAll('section')].find((el) => el.innerText.includes('上游用量'));
+    const text = card?.innerText ?? '';
+    const tracks = [...card?.querySelectorAll('[role="img"] > span') ?? []];
+    return {
+      text, calls: Number(text.match(/出网 (\d+) 次/)?.[1] ?? -1), bars: tracks.length,
+      trackH: Math.round(tracks[0]?.getBoundingClientRect().height ?? 0),
+      barMax: Math.round(Math.max(0, ...tracks.map((t) => t.firstElementChild?.getBoundingClientRect().height ?? 0))),
+    };
+  });
+  const usage = await usageOf();
+  ok('usage-card-shows-calls-layers-and-minute-bars', usage.calls >= 0
+    && /缓存挡下 \d+ · 放行 \d+/.test(usage.text) && usage.text.includes('按能力') && usage.text.includes('按源')
+    && usage.bars === 30, `出网 ${usage.calls} 次 · 柱 ${usage.bars} 格`);
+  // 柱条必须真的量得到：轨道 40px 高、至少一格有非零高度，否则「30 格」只是 DOM 里存在而已
+  ok('minute-bars-actually-render-height', usage.trackH === 40 && usage.barMax > 0,
+    `轨道 ${usage.trackH}px · 最高一格 ${usage.barMax}px`);
+  await page.getByRole('button', { name: '归零计数' }).click();
+  await page.waitForFunction((was) => {
+    const card = [...document.querySelectorAll('section')].find((el) => el.innerText.includes('上游用量'));
+    const now = Number((card?.innerText ?? '').match(/出网 (\d+) 次/)?.[1] ?? -1);
+    return now >= 0 && now < was;
+  }, usage.calls, { timeout: 8_000 });
+  ok('usage-reset-drops-the-counter', true, `归零前 ${usage.calls} 次 → 回读更小`);
+
   const layout = await page.evaluate(() => ({
     overflowX: document.documentElement.scrollWidth - document.documentElement.clientWidth,
     overflowY: document.documentElement.scrollHeight - document.documentElement.clientHeight,

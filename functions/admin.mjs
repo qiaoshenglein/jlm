@@ -3,15 +3,33 @@
 import { MICRO, START_CASH, START_CASH_USD, clampText, etParts, inRange, normalizeLines, setParams, startBaseOf } from './rules.mjs';
 import { DEFAULT_PARAMS, DEFAULT_PARAMS_US, activeParams } from './rules.mjs';
 import {
-  QUOTE_HOSTS, QUOTE_PROBES, QUOTE_SOURCE_DEFAULTS, US_INDEXES, checkQuoteSource, fxSource, getFx, getQuotes, getUsQuotes,
+  CAP_LABELS, QUOTE_HOSTS, QUOTE_PROBES, QUOTE_SOURCE_DEFAULTS, US_INDEXES, checkQuoteSource, fxSource, getFx, getQuotes, getUsQuotes,
   probeQuoteSource, quoteHealth, quoteProviders, quoteSource, setQuoteSource,
 } from './quotes.mjs';
+import { resetUsage, usageSnapshot } from './usage.mjs';
 import { replay, startCashOf, tradesOf } from './ledger.mjs';
 import { newId } from './auth.mjs';
 import { applyBackup, exportBackup, inspectBackup, planBackup } from './backup.mjs';
 import {
   PROXY_API_PRESETS, PROXY_DEFAULTS, checkProxyPolicy, maskApiUrl, proxyPolicy, proxyRuntime, proxyStatus, setProxyPolicy,
 } from './proxy.mjs';
+
+// 上游用量的层名：键在 usage.mjs 里是稳定的机器名，这里只负责给人看的那一列
+const USAGE_LAYERS = {
+  trends: '分时缓存', kline: 'K 线缓存', pool_cn: '沪深行情池快照', pool_us: '美股行情池快照',
+  extra: '池外标的补价', fx: '汇率',
+};
+
+function quoteUsagePayload(at = Date.now()) {
+  const usage = usageSnapshot(at);
+  const providerLabels = new Map(quoteProviders().map((item) => [item.key, item.label]));
+  return {
+    ...usage,
+    byCap: usage.byCap.map((row) => ({ ...row, label: CAP_LABELS[row.key] ?? row.key })),
+    byProvider: usage.byProvider.map((row) => ({ ...row, label: providerLabels.get(row.key) ?? row.key })),
+    cache: usage.cache.map((row) => ({ ...row, label: USAGE_LAYERS[row.layer] ?? row.layer })),
+  };
+}
 
 // 只允许「改了只影响未来」的键。开户本金的历史账户值冻结在 users.start_cash / start_cash_usd 里，
 // 这里改的是「新账户默认值」，不会重写任何已存在的账本；已落库的成交与费用永不重算。
@@ -514,6 +532,13 @@ export async function runAdmin({ store, action, admin, body, nowMs, today, ip, f
         lastCheck: lastProxyCheck,
       },
     };
+  }
+
+  // 上游用量：回答「我刚才那一下出没出网」。计数在进程里，重启归零，所以同时给出 since
+  if (action === 'admin_quote_usage') return quoteUsagePayload(nowMs);
+  if (action === 'admin_quote_usage_reset') {
+    resetUsage(nowMs);
+    return quoteUsagePayload(nowMs);
   }
 
   // ---- 代理：取列表 / 逐个验活 ----

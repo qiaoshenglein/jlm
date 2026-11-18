@@ -440,6 +440,95 @@ try {
   await page.waitForFunction(() => !document.body.innerText.includes('API 接口与密钥'), null, { timeout: 5_000 });
   ok('api-drawer-closes-on-escape', true);
 
+  // 8b) 面板显隐：F 专注、[ ] \ 单独收放、边缘把手一键召回、状态写进 localStorage
+  // 切回沪深时 switchMarket 会清掉选中项，没有图表就量不出「收起侧栏后图变大了多少」
+  await page.locator('.dense-row:not([aria-hidden])').first().click();
+  await page.waitForFunction(() => [...document.querySelectorAll('svg[role="img"]')]
+    .some((s) => /分时|K 线/.test(s.getAttribute('aria-label') ?? '')), null, { timeout: 10_000 });
+  const layout = () => page.evaluate(() => {
+    const main = document.querySelector('main');
+    const svg = [...document.querySelectorAll('svg[role="img"]')]
+      .find((item) => /分时|K 线/.test(item.getAttribute('aria-label') ?? ''));
+    const box = svg?.getBoundingClientRect();
+    const toggles = [...document.querySelectorAll('[aria-label="面板显隐"] button')]
+      .map((b) => `${b.textContent.trim()}=${b.getAttribute('aria-pressed')}`);
+    return {
+      cols: getComputedStyle(main).gridTemplateColumns.split(' ').filter(Boolean).length,
+      list: document.querySelectorAll('main input[aria-label^="搜索标的"]').length,
+      ticket: document.querySelectorAll('#order-qty').length,
+      // 行情分类里也有一个「持仓」标签，但它带 role=tab；账本那一排是 aria-selected 的普通按钮
+      book: [...document.querySelectorAll('button[aria-selected]:not([role="tab"])')]
+        .filter((b) => b.textContent.startsWith('持仓')).length,
+      chartW: Math.round(box?.width ?? 0),
+      chartH: Math.round(box?.height ?? 0),
+      handles: [...document.querySelectorAll('main > button[aria-label^="展开"]')].map((b) => b.getAttribute('aria-label')),
+      toggles,
+      scrollY: document.documentElement.scrollHeight - document.documentElement.clientHeight,
+      saved: localStorage.getItem('mirror.desk.panels'),
+    };
+  });
+  const base8 = await layout();
+  // 图表尺寸由 ResizeObserver 转一圈才落地，收起面板后立刻量会读到旧值，所以按条件轮询
+  const waitChart = async (predicate) => {
+    for (let i = 0; i < 40; i++) {
+      const size = await page.evaluate(() => {
+        const svg = [...document.querySelectorAll('svg[role="img"]')]
+          .find((item) => /分时|K 线/.test(item.getAttribute('aria-label') ?? ''));
+        const box = svg?.getBoundingClientRect();
+        return { w: Math.round(box?.width ?? 0), h: Math.round(box?.height ?? 0) };
+      });
+      if (predicate(size)) return size;
+      await page.waitForTimeout(50);
+    }
+    return { w: 0, h: 0 };
+  };
+  ok('panel-toggles-listed-in-footer', base8.cols === 3 && base8.list === 1 && base8.ticket === 1 && base8.book === 1
+    && base8.toggles.length === 4 && base8.toggles.slice(0, 3).every((t) => t.endsWith('=true')) && base8.chartW > 300,
+    `cols=${base8.cols} list=${base8.list} ticket=${base8.ticket} book=${base8.book} chart=${base8.chartW}x${base8.chartH} toggles=${base8.toggles.join(' ')}`);
+
+  await page.keyboard.press('f');
+  await page.waitForFunction(() => document.querySelectorAll('#order-qty').length === 0, null, { timeout: 5_000 });
+  await waitChart((size) => size.w > base8.chartW + 200 && size.h > base8.chartH + 80);
+  const focused = await layout();
+  ok('f-key-hides-all-three-panels', focused.cols === 1 && focused.list === 0 && focused.ticket === 0 && focused.book === 0
+    && focused.toggles.some((t) => t.includes('退出专注=true')),
+    `cols=${focused.cols} list=${focused.list} ticket=${focused.ticket} book=${focused.book} toggles=${focused.toggles.join(' ')}`);
+  ok('focus-mode-grows-the-chart', focused.chartW > base8.chartW + 200 && focused.chartH > base8.chartH + 80,
+    `${base8.chartW}x${base8.chartH} → ${focused.chartW}x${focused.chartH}`);
+  ok('focus-mode-keeps-handles-and-no-page-scroll', focused.handles.length === 2 && focused.scrollY <= 0,
+    `handles=${focused.handles.join('|')} scrollY=${focused.scrollY}`);
+
+  await page.keyboard.press('Escape');
+  await page.waitForFunction(() => document.querySelectorAll('#order-qty').length === 1, null, { timeout: 5_000 });
+  await waitChart((size) => size.w > 0 && size.w <= base8.chartW + 40);
+  const restored = await layout();
+  ok('escape-exits-focus-mode', restored.cols === 3 && restored.chartW === base8.chartW && restored.book === 1,
+    `cols=${restored.cols} chartW=${restored.chartW}（基准 ${base8.chartW}） book=${restored.book}`);
+
+  await page.keyboard.press('[');
+  await page.waitForFunction(() => document.querySelectorAll('main input[aria-label^="搜索标的"]').length === 0, null, { timeout: 5_000 });
+  const noList = await layout();
+  ok('bracket-key-hides-only-the-list', noList.cols === 2 && noList.list === 0 && noList.ticket === 1 && noList.book === 1
+    && noList.chartW > base8.chartW && noList.handles.join() === '展开行情列表',
+    `cols=${noList.cols} list=${noList.list} ticket=${noList.ticket} book=${noList.book} chartW=${base8.chartW}→${noList.chartW} handles=${noList.handles.join('|')}`);
+  await page.locator('main > button[aria-label="展开行情列表"]').click();
+  await page.waitForFunction(() => document.querySelectorAll('main input[aria-label^="搜索标的"]').length === 1, null, { timeout: 5_000 });
+  ok('edge-handle-brings-the-list-back', (await layout()).cols === 3);
+
+  await page.keyboard.press('\\');
+  await page.waitForFunction(() => [...document.querySelectorAll('button[aria-selected]:not([role="tab"])')]
+    .filter((b) => b.textContent.startsWith('持仓')).length === 0, null, { timeout: 5_000 });
+  await waitChart((size) => size.h > base8.chartH + 80);
+  const noBook = await layout();
+  ok('backslash-key-hides-only-the-book', noBook.book === 0 && noBook.list === 1 && noBook.ticket === 1
+    && noBook.chartH > base8.chartH + 80, `book=${noBook.book} list=${noBook.list} ticket=${noBook.ticket} chartH=${base8.chartH}→${noBook.chartH}`);
+  ok('panel-state-persists-to-localstorage', JSON.parse(noBook.saved ?? '{}').book === false
+    && JSON.parse(noBook.saved ?? '{}').list === true, noBook.saved ?? 'null');
+  await page.keyboard.press('\\');
+  await page.waitForFunction(() => [...document.querySelectorAll('button[aria-selected]:not([role="tab"])')]
+    .some((b) => b.textContent.startsWith('持仓')), null, { timeout: 5_000 });
+  ok('book-returns-on-second-backslash', (await layout()).book === 1);
+
   // 9) mobile shell: smaller page size, everything on screen
   await page.setViewportSize({ width: 390, height: 844 });
   await page.waitForTimeout(600);
